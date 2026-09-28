@@ -3837,43 +3837,47 @@ def render_crm_table(df: pd.DataFrame, key: str):
         return st.dataframe(df, use_container_width=True, **common)
 
 
+def render_zoho_setup() -> None:
+    """One-off box: swaps a Self Client code for a refresh token, done inside the app."""
+    render_html(
+        '<div class="pe-panel"><div class="h">One-off Zoho setup</div>'
+        '<div style="font-size:.86rem;line-height:1.55;color:var(--muted)">'
+        "<b>1.</b> In <b>api-console.zoho.eu</b>, open your Self Client and go to <b>Generate Code</b>.<br>"
+        "<b>2.</b> Paste the scope below, pick <b>10 minutes</b>, add any description and click <b>Create</b>.<br>"
+        "<b>3.</b> Copy the code it shows (starts <b>1000.</b>), paste it here and click Connect. Be quick: codes expire.</div></div>"
+    )
+    st.code("ZohoCRM.modules.leads.READ,ZohoCRM.coql.READ,ZohoCRM.settings.fields.READ,ZohoCRM.org.READ",
+            language=None)
+    with st.form("zoho_setup", border=False):
+        zc1, zc2 = columns([2.2, 1])
+        with zc1:
+            setup_code = st.text_input("Code from Zoho", type="password", placeholder="1000.xxxxxxxx…")
+        with zc2:
+            setup_go = st.form_submit_button("Connect Zoho", type="primary", **FULL_WIDTH)
+    if setup_go:
+        if not setup_code.strip():
+            st.warning("Paste the code from Zoho first.")
+        else:
+            with st.spinner("Asking Zoho for a permanent key…"):
+                st.session_state["zoho_setup_result"] = ZOHO.exchange_code(setup_code)
+    result = st.session_state.get("zoho_setup_result") or {}
+    if result.get("error"):
+        st.error(result["error"])
+    elif result.get("refresh_token"):
+        st.success("Connected. Zoho gave us a permanent key. Last step:")
+        st.code(f'ZOHO_REFRESH_TOKEN = "{result["refresh_token"]}"', language=None)
+        st.caption(
+            "Copy that whole line (the copy icon is on the right) into this app's Streamlit Secrets,"
+            " save, then reboot the app. This box then disappears. The key is shown only on this screen"
+            " and isn't saved anywhere else, so don't share it in emails or chats."
+        )
+
 with col_left:
     with st.container(key="card-left"):
         section_header("01", "Zoho leads", "Pull leads from your CRM by status, then enrich the gaps.")
         crm_ready = False
         if ZOHO.can_setup:
-            render_html(
-                '<div class="pe-panel"><div class="h">One-off Zoho setup</div>'
-                '<div style="font-size:.86rem;line-height:1.55;color:var(--muted)">'
-                "<b>1.</b> In <b>api-console.zoho.eu</b>, open your Self Client and go to <b>Generate Code</b>.<br>"
-                "<b>2.</b> Paste the scope below, pick <b>10 minutes</b>, add any description and click <b>Create</b>.<br>"
-                "<b>3.</b> Copy the code it shows (starts <b>1000.</b>), paste it here and click Connect. Be quick: codes expire.</div></div>"
-            )
-            st.code("ZohoCRM.modules.leads.READ,ZohoCRM.coql.READ,ZohoCRM.settings.fields.READ,ZohoCRM.org.READ",
-                    language=None)
-            with st.form("zoho_setup", border=False):
-                zc1, zc2 = columns([2.2, 1])
-                with zc1:
-                    setup_code = st.text_input("Code from Zoho", type="password", placeholder="1000.xxxxxxxx…")
-                with zc2:
-                    setup_go = st.form_submit_button("Connect Zoho", type="primary", **FULL_WIDTH)
-            if setup_go:
-                if not setup_code.strip():
-                    st.warning("Paste the code from Zoho first.")
-                else:
-                    with st.spinner("Asking Zoho for a permanent key…"):
-                        st.session_state["zoho_setup_result"] = ZOHO.exchange_code(setup_code)
-            result = st.session_state.get("zoho_setup_result") or {}
-            if result.get("error"):
-                st.error(result["error"])
-            elif result.get("refresh_token"):
-                st.success("Connected. Zoho gave us a permanent key. Last step:")
-                st.code(f'ZOHO_REFRESH_TOKEN = "{result["refresh_token"]}"', language=None)
-                st.caption(
-                    "Copy that whole line (the copy icon is on the right) into this app's Streamlit Secrets,"
-                    " save, then reboot the app. This box then disappears. The key is shown only on this screen"
-                    " and isn't saved anywhere else, so don't share it in emails or chats."
-                )
+            render_zoho_setup()
         elif not ZOHO.configured:
             render_html(
                 f'<div class="pe-hint">{icon("pointer", 16)}<div>Zoho CRM isn\'t connected yet. Add '
@@ -3882,7 +3886,11 @@ with col_left:
             )
         else:
             meta_error = load_zoho_meta()
-            if meta_error:
+            if meta_error and "invalid_code" in meta_error:
+                st.error("The ZOHO_REFRESH_TOKEN in Secrets isn't a working key (it may be the short-lived code"
+                         " rather than the permanent key). Get a new one below, then replace that line in Secrets.")
+                render_zoho_setup()
+            elif meta_error:
                 st.error(meta_error)
                 if st.button("Try again", key="zoho_retry"):
                     st.session_state.pop("zoho_token", None)
