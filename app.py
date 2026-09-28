@@ -1234,6 +1234,8 @@ class LeadEnricher:
             "website": best.get("websiteUri", ""),
             "phone": normalise_uk_phone(best.get("nationalPhoneNumber", "")) or "",
             "address": best.get("formattedAddress", ""),
+            "types": list(best.get("types") or []) + ([best["primaryType"]] if best.get("primaryType") else []),
+            "type_label": ((best.get("primaryTypeDisplayName") or {}).get("text") or ""),
         }
         self.last_places_note = f"Google Maps: matched '{found['name']}'"
         return found
@@ -2624,7 +2626,8 @@ ZOHO_LEAD_FIELDS = [
     "Lead_Status", "Lead_Source", "Industry", "Street", "City", "State", "Zip_Code", "Country",
     "Email_Opt_Out", "Created_Time", "Modified_Time", "Last_Activity_Time", "Description",
 ]
-ZOHO_MAX_LEADS = 2000
+ZOHO_MAX_LEADS = 10000
+ZOHO_PAGE = 2000  # COQL maximum per call
 ZOHO_SEND_LIMIT = 100  # Zoho's Send Mail API allows 100 emails a day
 ZOHO_SCOPE = ("ZohoCRM.modules.leads.ALL,ZohoCRM.modules.notes.CREATE,ZohoCRM.coql.READ,"
               "ZohoCRM.settings.fields.READ,ZohoCRM.org.READ,ZohoCRM.send_mail.leads.CREATE,"
@@ -2759,14 +2762,19 @@ class ZohoCRM:
         offset = 0
         while offset < ZOHO_MAX_LEADS:
             query = (f"select {', '.join(fields)} from Leads where Lead_Status in ({quoted}) "
-                     f"order by Created_Time desc limit {offset}, 200")
-            body = self._request("POST", "/crm/v8/coql", json={"select_query": query})
+                     f"order by Created_Time desc limit {offset}, {ZOHO_PAGE}")
+            try:
+                body = self._request("POST", "/crm/v8/coql", json={"select_query": query})
+            except ZohoError:
+                if out:  # Keep what we have if a later page fails
+                    break
+                raise
             if not body:
                 break
             out.extend(body.get("data") or [])
             if not (body.get("info") or {}).get("more_records"):
                 break
-            offset += 200
+            offset += ZOHO_PAGE
         return out
 
     # ---------- writes (phase 2): send, fill blanks, notes ----------
@@ -2826,6 +2834,30 @@ SECTOR_KEYWORDS = {
 }
 
 
+# Companies House SIC code prefixes for each pitch
+SIC_SECTOR_PREFIXES = {
+    "683": "Estate & Lettings Agents", "8623": "Dental Practices", "691": "Solicitors & Legal Practices",
+    "692": "Accountants & Auditors", "8621": "General Medical Clinics", "8622": "General Medical Clinics",
+    "869": "General Medical Clinics",
+}
+
+
+def sector_from_sic(sic_codes: List[str]) -> Optional[str]:
+    for code in sic_codes or []:
+        for prefix, sector in SIC_SECTOR_PREFIXES.items():
+            if str(code).startswith(prefix):
+                return sector
+    return None
+
+
+def sector_from_place_types(types: List[str]) -> Optional[str]:
+    tset = set(types or [])
+    for sector, rules in SECTOR_PLACE_RULES.items():
+        if tset & set(rules["types"]):
+            return sector
+    return None
+
+
 def guess_sector(company: str, industry: str = "", description: str = "") -> str:
     hay = f" {company} {industry} {description} ".lower()
     for sector, words in SECTOR_KEYWORDS.items():
@@ -2872,7 +2904,8 @@ def _full_name(rec: Dict[str, Any]) -> str:
     return " ".join(p for p in [(rec.get("First_Name") or "").strip(), (rec.get("Last_Name") or "").strip()] if p)
 
 
-def enrich_crm_lead(rec: Dict[str, Any], vertical: str, ch_key: str, manual_website: Optional[str] = None) -> ScrapedLead:
+def enrich_crm_lead(rec: Dict[str, Any], vertical: str, ch_key: str, manual_website: Optional[str] = None,
+                    auto_sector: bool = False) -> ScrapedLead:
     """Enriches one Zoho lead. What Zoho already knows comes first; we only add what's missing."""
     e = LeadEnricher(ch_api_key=ch_key)
     company = (rec.get("Company") or _full_name(rec) or "Unknown company").strip()
@@ -2884,6 +2917,12 @@ def enrich_crm_lead(rec: Dict[str, Any], vertical: str, ch_key: str, manual_webs
     company_number = ch.get("company_number") if ch else None
     officers = e.get_officers(company_number) if company_number else []
     reg_address = ch.get("address_snippet") if ch else None
+    sic_codes: List[str] = []
+    if company_number:
+        try:
+            sic_codes = list(e.get_company_details(company_number).get("sic_codes") or [])
+        except Exception:
+            sic_codes = []
     notes.append(f"Companies House: matched {ch.get('title')} (#{company_number})" if ch
                  else "Companies House: no confident match" if ch_key else "Companies House lookup not set up")
 
@@ -2920,10 +2959,29 @@ def enrich_crm_lead(rec: Dict[str, Any], vertical: str, ch_key: str, manual_webs
         if ph and ph not in phones:
             phones.append(ph)
 
+    # 5. Auto pitch: the name/Zoho industry wins; otherwise Companies House SIC, Google Maps type, then website text
+    sector_note = None
+    if auto_sector and vertical == "General Business":
+        by_sic = sector_from_sic(sic_codes)
+        by_maps = sector_from_place_types(places.get("types", []) if places else [])
+        by_site = guess_sector(" ".join(filter(None, [trading, site.get("description") or ""])))
+        if by_sic:
+            vertical, sector_note = by_sic, f"Pitch: {by_sic} (Companies House SIC {sic_codes[0]})"
+        elif by_maps:
+            vertical, sector_note = by_maps, f"Pitch: {by_maps} (Google Maps lists it as {places.get('type_label') or 'this type'})"
+        elif by_site != "General Business":
+            vertical, sector_note = by_site, f"Pitch: {by_site} (from its website)"
+        else:
+            sector_note = "Pitch: General Business (couldn't tell the sector)"
+    elif auto_sector:
+        sector_note = f"Pitch: {vertical} (from the company name / Zoho industry)"
+    if sector_note:
+        notes.append(sector_note)
+
     lead = ScrapedLead(
         company_name=company,
         company_number=company_number,
-        sic_codes=[],
+        sic_codes=sic_codes,
         sector_guess=vertical,
         registered_address=reg_address or ", ".join(p for p in [rec.get("Street"), town, postcode] if p) or None,
         website_url=site.get("resolved_url") or target,
@@ -3340,7 +3398,7 @@ def run_enrichment(
 
 def run_crm_enrichment(
     recs: List[Dict[str, Any]],
-    sector_for: Callable[[Dict[str, Any]], str],
+    sector_for: Callable[[Dict[str, Any]], Tuple[str, bool]],
     manual_websites: Optional[Dict[str, str]] = None,
 ) -> None:
     """Enriches Zoho leads 4 at a time and adds them to the review queue. manual_websites: {zoho_id: url}."""
@@ -3349,7 +3407,8 @@ def run_crm_enrichment(
 
     def _enrich(rec: Dict[str, Any]) -> ScrapedLead:
         rid = str(rec.get("id"))
-        return enrich_crm_lead(rec, sector_for(rec), ch_api_key, manual_website=manual_websites.get(rid) or None)
+        sector, auto = sector_for(rec)
+        return enrich_crm_lead(rec, sector, ch_api_key, manual_website=manual_websites.get(rid) or None, auto_sector=auto)
 
     results: Dict[str, ScrapedLead] = {}
     failures: List[str] = []
@@ -3375,12 +3434,16 @@ def run_crm_enrichment(
         st.session_state["current_cn"] = first
         st.session_state["current_cn_select"] = first
     st.session_state["stat_dossiers"] += len(results)
+    record_research(list(results.values()))
+    flash = []
     if failures:
-        st.warning("Couldn't enrich: " + ", ".join(failures))
-    if len(recs) > 1 and results:
+        flash.append(("warning", "Couldn't enrich: " + ", ".join(failures)))
+    if results:
         with_email = sum(1 for r in results.values() if r.emails_found and not r.email_opt_out)
-        st.success(f"{len(results)} leads enriched: {with_email} ready to email, {len(results) - with_email} to call"
-                   " or research. See Review & send below.")
+        flash.append(("success", f"{len(results)} {'lead' if len(results) == 1 else 'leads'} enriched: {with_email} ready"
+                                 f" to email, {len(results) - with_email} to call or research."))
+    st.session_state["enrich_flash"] = flash
+    st.rerun()  # Redraw so the table hides what was just worked
 
 
 # ------------------------------------------------------------------
@@ -3608,6 +3671,7 @@ with st.sidebar:
         st.session_state.pop("contacts_data", None)
         st.session_state.pop("zoho_fields", None)
         st.session_state.pop("zoho_from", None)
+        st.session_state.pop("research_data", None)
         st.session_state["call_ver"] = st.session_state.get("call_ver", 0) + 1
         st.session_state["sent_log_ver"] = st.session_state.get("sent_log_ver", 0) + 1
         bump_queue_editor()
@@ -3996,12 +4060,13 @@ def load_zoho_meta() -> Optional[str]:
 def render_crm_table(df: pd.DataFrame, key: str):
     column_config = {
         "Company": st.column_config.TextColumn("Company", width=170),
+        "Area": st.column_config.TextColumn("Area", width=110),
+        "Sector": st.column_config.TextColumn("Likely sector", width=120, help="First guess from the name / Zoho industry"),
         "Contact": st.column_config.TextColumn("Contact", width=110),
         "Gaps": st.column_config.TextColumn("Missing", width=110, help="What Zoho doesn't have yet. Enrichment tries to fill these."),
-        "Contacted": st.column_config.TextColumn("Contacted", width=96, help="Already emailed or handled in this app"),
+        "Contacted": st.column_config.TextColumn("Worked", width=96, help="✓ emailed · 📞 on the call list · 🔎 researched recently"),
         "Email": st.column_config.TextColumn("Email", width=150),
         "Phone": st.column_config.TextColumn("Phone", width=105),
-        "City": st.column_config.TextColumn("City", width=85),
         "Source": st.column_config.TextColumn("Source", width=90),
         "Created": st.column_config.DateColumn("Created", format="D MMM YYYY", width=88),
         "Zoho": st.column_config.LinkColumn("Zoho", display_text="Open ↗", width=58, help="Opens the lead in Zoho CRM"),
@@ -4051,6 +4116,130 @@ def render_zoho_setup() -> None:
             " and isn't saved anywhere else, so don't share it in emails or chats."
         )
 
+# ---- Areas: UK postcode areas, grouped into regions ----
+POSTCODE_AREAS = {
+    "AB": "Aberdeen", "AL": "St Albans", "B": "Birmingham", "BA": "Bath", "BB": "Blackburn", "BD": "Bradford",
+    "BH": "Bournemouth", "BL": "Bolton", "BN": "Brighton", "BR": "Bromley", "BS": "Bristol", "BT": "Belfast",
+    "CA": "Carlisle", "CB": "Cambridge", "CF": "Cardiff", "CH": "Chester", "CM": "Chelmsford", "CO": "Colchester",
+    "CR": "Croydon", "CT": "Canterbury", "CV": "Coventry", "CW": "Crewe", "DA": "Dartford", "DD": "Dundee",
+    "DE": "Derby", "DG": "Dumfries", "DH": "Durham", "DL": "Darlington", "DN": "Doncaster", "DT": "Dorchester",
+    "DY": "Dudley", "E": "East London", "EC": "Central London", "EH": "Edinburgh", "EN": "Enfield", "EX": "Exeter",
+    "FK": "Falkirk", "FY": "Blackpool", "G": "Glasgow", "GL": "Gloucester", "GU": "Guildford", "GY": "Guernsey",
+    "HA": "Harrow", "HD": "Huddersfield", "HG": "Harrogate", "HP": "Hemel Hempstead", "HR": "Hereford",
+    "HS": "Outer Hebrides", "HU": "Hull", "HX": "Halifax", "IG": "Ilford", "IM": "Isle of Man", "IP": "Ipswich",
+    "IV": "Inverness", "JE": "Jersey", "KA": "Kilmarnock", "KT": "Kingston upon Thames", "KW": "Kirkwall",
+    "KY": "Kirkcaldy", "L": "Liverpool", "LA": "Lancaster", "LD": "Llandrindod Wells", "LE": "Leicester",
+    "LL": "Llandudno", "LN": "Lincoln", "LS": "Leeds", "LU": "Luton", "M": "Manchester", "ME": "Rochester",
+    "MK": "Milton Keynes", "ML": "Motherwell", "N": "North London", "NE": "Newcastle", "NG": "Nottingham",
+    "NN": "Northampton", "NP": "Newport", "NR": "Norwich", "NW": "North West London", "OL": "Oldham",
+    "OX": "Oxford", "PA": "Paisley", "PE": "Peterborough", "PH": "Perth", "PL": "Plymouth", "PO": "Portsmouth",
+    "PR": "Preston", "RG": "Reading", "RH": "Redhill", "RM": "Romford", "S": "Sheffield", "SA": "Swansea",
+    "SE": "South East London", "SG": "Stevenage", "SK": "Stockport", "SL": "Slough", "SM": "Sutton",
+    "SN": "Swindon", "SO": "Southampton", "SP": "Salisbury", "SR": "Sunderland", "SS": "Southend-on-Sea",
+    "ST": "Stoke-on-Trent", "SW": "South West London", "SY": "Shrewsbury", "TA": "Taunton", "TD": "Galashiels",
+    "TF": "Telford", "TN": "Tonbridge", "TQ": "Torquay", "TR": "Truro", "TS": "Middlesbrough", "TW": "Twickenham",
+    "UB": "Southall", "W": "West London", "WA": "Warrington", "WC": "Central London", "WD": "Watford",
+    "WF": "Wakefield", "WN": "Wigan", "WR": "Worcester", "WS": "Walsall", "WV": "Wolverhampton", "YO": "York",
+    "ZE": "Shetland",
+}
+REGIONS = {
+    "West Midlands": ["B", "CV", "DY", "WS", "WV", "WR", "TF", "ST", "HR", "SY"],
+    "East Midlands": ["DE", "LE", "NG", "NN", "LN"],
+    "North West": ["M", "L", "BL", "BB", "CH", "CW", "FY", "LA", "OL", "PR", "SK", "WA", "WN", "CA"],
+    "Yorkshire": ["LS", "BD", "HD", "HX", "HG", "HU", "S", "DN", "WF", "YO"],
+    "North East": ["NE", "DH", "DL", "SR", "TS"],
+    "London": ["E", "EC", "N", "NW", "SE", "SW", "W", "WC", "BR", "CR", "DA", "EN", "HA", "IG", "KT", "RM", "SM", "TW", "UB"],
+    "South East": ["BN", "CT", "GU", "ME", "MK", "OX", "PO", "RG", "RH", "SL", "SO", "TN", "HP", "AL", "SG", "WD", "LU"],
+    "East of England": ["CB", "CM", "CO", "IP", "NR", "PE", "SS"],
+    "South West": ["BA", "BH", "BS", "DT", "EX", "GL", "PL", "SN", "SP", "TA", "TQ", "TR"],
+    "Wales": ["CF", "LD", "LL", "NP", "SA"],
+    "Scotland": ["AB", "DD", "DG", "EH", "FK", "G", "HS", "IV", "KA", "KW", "KY", "ML", "PA", "PH", "TD", "ZE"],
+    "Northern Ireland": ["BT"],
+}
+_TOWN_TO_AREA = {name.lower(): code for code, name in POSTCODE_AREAS.items() if "London" not in name}
+NO_AREA = "Unknown (no postcode)"
+
+
+def area_of(rec: Dict[str, Any]) -> str:
+    """Postcode area code (e.g. 'WS'), or a best guess from the town, or NO_AREA."""
+    m = re.match(r"^([A-Z]{1,2})\d", (rec.get("Zip_Code") or "").upper().replace(" ", ""))
+    if m and m.group(1) in POSTCODE_AREAS:
+        return m.group(1)
+    return _TOWN_TO_AREA.get((rec.get("City") or "").strip().lower(), NO_AREA)
+
+
+def area_label(code: str) -> str:
+    return code if code == NO_AREA else f"{code} · {POSTCODE_AREAS.get(code, code)}"
+
+
+def expand_areas(choices: List[str]) -> Set[str]:
+    out: Set[str] = set()
+    for c in choices:
+        if c.startswith("Region: "):
+            out.update(REGIONS.get(c[8:], []))
+        else:
+            out.add(c)
+    return out
+
+
+# ---- Research memory: leads already enriched, so tomorrow's batch skips them ----
+RESEARCH_STORE = SentLog("GITHUB_CRM_RESEARCH_PATH", "crm_researched.json", ".crm_researched.json")
+RESEARCH_SKIP_DAYS = 30
+
+
+def get_research() -> Dict[str, Any]:
+    if "research_data" not in st.session_state:
+        st.session_state["research_data"] = RESEARCH_STORE.load()
+    return st.session_state["research_data"]
+
+
+def record_research(leads: List[ScrapedLead]) -> None:
+    stamp = now_uk().isoformat(timespec="seconds")
+    who = get_sender().get("name", "")
+    changes = {l.crm_id: {"company": l.company_name, "at": stamp, "by": who, "email": bool(l.emails_found),
+                          "sector": l.sector_guess} for l in leads if l.crm_id}
+    if not changes:
+        return
+    try:
+        st.session_state["research_data"] = RESEARCH_STORE.apply(changes, f"Lead Revival: {len(changes)} researched")
+    except Exception:
+        st.session_state.setdefault("research_data", {}).update(changes)
+
+
+def recently_researched(rid: str) -> Optional[Dict[str, Any]]:
+    rec = get_research().get(rid)
+    if not rec:
+        return None
+    try:
+        age = now_uk() - datetime.fromisoformat(rec["at"])
+    except (KeyError, ValueError):
+        return None
+    return rec if age.days < RESEARCH_SKIP_DAYS else None
+
+
+def today_summary() -> str:
+    today = now_uk().date().isoformat()
+    researched = sum(1 for r in get_research().values() if str(r.get("at", "")).startswith(today))
+    emailed = sum(1 for r in get_sent_log().values()
+                  if str(r.get("sent_at", "")).startswith(today) and "Emailed" in (r.get("status") or ""))
+    called = sum(1 for r in get_call_list().values() if str(r.get("added_at", "")).startswith(today))
+    return f"Today, whole team: {researched} researched · {emailed} emailed · {called} added to the call list"
+
+
+def _qp_list(name: str) -> List[str]:
+    raw = st.query_params.get(name, "")
+    return [x for x in raw.split("|") if x] if raw else []
+
+
+def _qp_save(name: str, values: List[str]) -> None:
+    joined = "|".join(values)
+    if st.query_params.get(name, "") != joined:
+        if joined:
+            st.query_params[name] = joined
+        elif name in st.query_params:
+            del st.query_params[name]
+
+
 with col_left:
     with st.container(key="card-left"):
         section_header("01", "Zoho leads", "Pull leads from your CRM by status, then enrich the gaps.")
@@ -4079,13 +4268,15 @@ with col_left:
 
         if crm_ready:
             statuses = ZOHO.lead_statuses(st.session_state["zoho_fields"]) or ["Not Contacted"]
-            default_status = [s for s in statuses if s.lower() == "not contacted"] or statuses[:1]
+            remembered = [x for x in _qp_list("status") if x in statuses]
+            default_status = remembered or [s for s in statuses if s.lower() == "not contacted"] or statuses[:1]
             s_col1, s_col2 = columns([2.2, 1])
             with s_col1:
                 chosen_statuses = st.multiselect("Lead Status", statuses, default=default_status,
                                                  help="Which Zoho leads to pull. Start with Not Contacted.")
             with s_col2:
                 load_btn = st.button("Load leads", type="primary", disabled=not chosen_statuses, **FULL_WIDTH)
+            _qp_save("status", chosen_statuses)
             if load_btn:
                 with st.spinner("Pulling leads from Zoho CRM…"):
                     try:
@@ -4098,106 +4289,191 @@ with col_left:
                 else:
                     for r in recs:
                         r["id"] = str(r.get("id"))
+                        r["_area"] = area_of(r)
+                        r["_sector"] = guess_sector(r.get("Company") or "", r.get("Industry") or "", r.get("Description") or "")
                     st.session_state["crm_leads"] = recs
                     st.session_state["crm_statuses_loaded"] = list(chosen_statuses)
                     st.session_state["search_version"] = st.session_state.get("search_version", 0) + 1
                     st.session_state["stat_searches"] += 1
                     st.session_state["stat_firms"] = len(recs)
+                    st.session_state.pop("research_data", None)  # Pick up colleagues' work
                     if not recs:
                         st.warning("No leads in Zoho with that status.")
                     elif len(recs) >= ZOHO_MAX_LEADS:
-                        st.info(f"Showing the newest {ZOHO_MAX_LEADS} leads.")
+                        st.info(f"Showing the newest {ZOHO_MAX_LEADS:,} leads.")
 
             recs_all = st.session_state.get("crm_leads") or []
             if recs_all:
                 n_email = sum(1 for r in recs_all if (r.get("Email") or "").strip())
                 n_opt = sum(1 for r in recs_all if r.get("Email_Opt_Out"))
+                n_known = sum(1 for r in recs_all if r["_sector"] != "General Business")
                 render_html(
                     '<div class="pe-stats" style="margin-top:6px">'
-                    f'<div class="pe-stat"><div class="v">{len(recs_all)}</div><div class="l">Leads</div></div>'
-                    f'<div class="pe-stat"><div class="v">{len(recs_all) - n_email}</div><div class="l">No email</div></div>'
-                    f'<div class="pe-stat"><div class="v">{n_opt}</div><div class="l">Opted out</div></div>'
+                    f'<div class="pe-stat"><div class="v">{len(recs_all):,}</div><div class="l">Leads</div></div>'
+                    f'<div class="pe-stat"><div class="v">{len(recs_all) - n_email:,}</div><div class="l">No email</div></div>'
+                    f'<div class="pe-stat"><div class="v">{n_known:,}</div><div class="l">Sector known</div></div>'
                     "</div>"
                 )
+                st.caption(("🚫 " + f"{n_opt} opted out of email · " if n_opt else "") + today_summary())
 
     recs_all = st.session_state.get("crm_leads") or []
     if recs_all:
         with st.container(key="card-select"):
             log_now = get_sent_log()
-            already = sum(1 for r in recs_all if r["id"] in log_now)
+            calls_now = get_call_list()
+            queued = st.session_state.get("queue", {})
             section_header(
-                "02", "Select leads",
-                f"{len(recs_all)} {'lead' if len(recs_all) == 1 else 'leads'} · "
+                "02", "Pick today's leads",
+                f"{len(recs_all):,} {'lead' if len(recs_all) == 1 else 'leads'} · "
                 + ", ".join(st.session_state.get("crm_statuses_loaded", []))
-                + (f" · {already} already contacted" if already else ""),
+                + " · narrow by area and sector, then enrich the next batch",
             )
-            sources = sorted({r.get("Lead_Source") or "—" for r in recs_all})
+            for kind, msg in st.session_state.pop("enrich_flash", []):
+                (st.success if kind == "success" else st.warning)(msg + (" See Review & send below." if kind == "success" else ""))
+
+            # --- Area + sector (remembered in the page link, so a bookmark reopens the same patch) ---
+            area_counts: Dict[str, int] = {}
+            for r in recs_all:
+                area_counts[r["_area"]] = area_counts.get(r["_area"], 0) + 1
+            region_opts = [f"Region: {rg}" for rg, codes in REGIONS.items()
+                           if any(area_counts.get(c) for c in codes)]
+            area_opts = region_opts + sorted([a for a in area_counts if a != NO_AREA], key=lambda a: -area_counts[a]) \
+                + ([NO_AREA] if NO_AREA in area_counts else [])
+
+            def _area_fmt(opt: str) -> str:
+                if opt.startswith("Region: "):
+                    n = sum(area_counts.get(c, 0) for c in REGIONS[opt[8:]])
+                    return f"🗺 {opt[8:]} ({n:,})"
+                return f"{area_label(opt)} ({area_counts.get(opt, 0):,})"
+
+            sector_counts: Dict[str, int] = {}
+            for r in recs_all:
+                sector_counts[r["_sector"]] = sector_counts.get(r["_sector"], 0) + 1
+            sector_opts = sorted(sector_counts, key=lambda x: (x == "General Business", -sector_counts[x]))
+            for _k, _opts in (("f_areas", area_opts), ("f_sectors", sector_opts)):
+                if _k in st.session_state:  # Drop choices that no longer exist after a reload
+                    st.session_state[_k] = [x for x in st.session_state[_k] if x in _opts]
+            if "f_areas" not in st.session_state:
+                st.session_state["f_areas"] = [a for a in _qp_list("areas") if a in area_opts]
+            if "f_sectors" not in st.session_state:
+                st.session_state["f_sectors"] = [x for x in _qp_list("sectors") if x in sector_opts]
+            a1, a2 = st.columns([1.3, 1])
+            with a1:
+                st.multiselect("Area", area_opts, key="f_areas", format_func=_area_fmt, placeholder="Anywhere",
+                               help="Postcode areas (or whole regions) from each lead's postcode. Leads without a"
+                                    " postcode are placed by town where possible.")
+            with a2:
+                st.multiselect("Likely sector", sector_opts, key="f_sectors", placeholder="All sectors",
+                               format_func=lambda x: f"{'Unknown / general' if x == 'General Business' else x} ({sector_counts[x]:,})",
+                               help="A first guess from the company name and Zoho industry. Enrichment checks it"
+                                    " against Companies House, Google Maps and the website before pitching.")
+            _qp_save("areas", st.session_state["f_areas"])
+            _qp_save("sectors", st.session_state["f_sectors"])
+
             f1, f2, f3 = columns([1.4, 1.2, 1])
             with f1:
                 q = st.text_input("Search", placeholder="Company, contact or town").strip().lower()
             with f2:
+                sources = sorted({r.get("Lead_Source") or "—" for r in recs_all})
                 src = st.multiselect("Lead source", sources, placeholder="All sources")
             with f3:
+                order = st.selectbox("Order", ["Newest first", "Oldest first"],
+                                     help="Which end of the list today's batch comes from.")
+            g1, g2 = st.columns(2)
+            with g1:
+                hide_done = st.toggle("Hide already-worked leads", value=True,
+                                      help=f"Hides leads already emailed, on the call list, or enriched in the last {RESEARCH_SKIP_DAYS}"
+                                           " days (by anyone), so each day starts where the last one finished.")
+            with g2:
                 gaps_only = st.toggle("Only leads with gaps", value=False,
                                       help="Hide leads that already have an email, phone, website and name in Zoho.")
+
+            wanted_areas = expand_areas(st.session_state["f_areas"])
+            wanted_sectors = set(st.session_state["f_sectors"])
+
+            def _done(r: Dict[str, Any]) -> bool:
+                return r["id"] in log_now or r["id"] in calls_now or bool(recently_researched(r["id"]))
+
             recs = [
                 r for r in recs_all
-                if (not q or q in " ".join(str(r.get(k) or "") for k in ("Company", "First_Name", "Last_Name", "City", "Email")).lower())
+                if (not wanted_areas or r["_area"] in wanted_areas)
+                and (not wanted_sectors or r["_sector"] in wanted_sectors)
+                and (not q or q in " ".join(str(r.get(k) or "") for k in ("Company", "First_Name", "Last_Name", "City", "Email", "Zip_Code")).lower())
                 and (not src or (r.get("Lead_Source") or "—") in src)
                 and (not gaps_only or lead_gaps(r))
+                and (not hide_done or not _done(r))
             ]
+            recs.sort(key=lambda r: r.get("Created_Time") or "", reverse=(order == "Newest first"))
+
+            def _status_label(r: Dict[str, Any]) -> str:
+                if r["id"] in log_now:
+                    return sent_label(log_now[r["id"]])
+                if r["id"] in calls_now:
+                    return "📞 Call list"
+                rr = recently_researched(r["id"])
+                if rr:
+                    try:
+                        return "🔎 " + datetime.fromisoformat(rr["at"]).strftime("%d %b").lstrip("0")
+                    except ValueError:
+                        return "🔎 Researched"
+                return "🚫 Opted out" if r.get("Email_Opt_Out") else ""
+
             if not recs:
-                st.caption("No leads match these filters.")
+                st.caption("No leads match these filters." + (" Everything here has already been worked. Turn off"
+                           " 'Hide already-worked leads' to see them." if hide_done else ""))
             else:
                 df = pd.DataFrame([{
                     "Company": r.get("Company") or _full_name(r),
                     "Contact": _full_name(r) if (r.get("First_Name") or "").strip() else "",
+                    "Area": "" if r["_area"] == NO_AREA else area_label(r["_area"]),
+                    "Sector": "" if r["_sector"] == "General Business" else r["_sector"],
                     "Gaps": ", ".join(lead_gaps(r)) or "—",
-                    "Contacted": sent_label(log_now.get(r["id"])) or ("🚫 Opted out" if r.get("Email_Opt_Out") else ""),
+                    "Contacted": _status_label(r),
                     "Email": r.get("Email") or "",
                     "Phone": r.get("Phone") or r.get("Mobile") or "",
-                    "City": r.get("City") or "",
                     "Source": r.get("Lead_Source") or "",
                     "Created": pd.to_datetime(r.get("Created_Time"), errors="coerce", utc=True),
                     "Zoho": ZOHO.record_url(r["id"]),
                 } for r in recs])
-                if "Created" in df.columns:
-                    df["Created"] = pd.to_datetime(df["Created"], errors="coerce", utc=True).dt.tz_localize(None)
-                filt_sig = abs(hash((q, tuple(src), gaps_only))) % 10**6
+                df["Created"] = pd.to_datetime(df["Created"], errors="coerce", utc=True).dt.tz_localize(None)
+                filt_sig = abs(hash((q, tuple(src), gaps_only, hide_done, order, tuple(sorted(wanted_areas)),
+                                     tuple(sorted(wanted_sectors))))) % 10**6
                 table_event = render_crm_table(df, key=f"crm_table_{st.session_state.get('search_version', 0)}_{filt_sig}")
                 sel_idx = [i for i in (table_event.selection.rows if table_event else []) if i < len(recs)]
                 selected = [recs[i] for i in sel_idx]
                 st.session_state["selected_rows_data"] = selected
 
-                pitch_choice = st.selectbox(
-                    "Pitch as", [AUTO_SECTOR] + list(VERTICAL_PRESETS.keys()),
-                    help="Auto picks the sector pitch from each lead's company name and Zoho industry;"
-                         " anything unclear gets the general business pitch. You can change it per lead afterwards.",
-                )
+                p1, p2 = columns([2, 1])
+                with p1:
+                    pitch_choice = st.selectbox(
+                        "Pitch as", [AUTO_SECTOR] + list(VERTICAL_PRESETS.keys()),
+                        help="Auto checks each lead's name and Zoho industry, then Companies House, Google Maps"
+                             " and its website to pick the sector pitch. Unclear ones get the general business pitch."
+                             " You can change it per lead afterwards.",
+                    )
+                with p2:
+                    batch_size = st.selectbox("Batch size", [10, 15, 20, 25], index=3,
+                                              help="25 a day keeps Google Maps inside the free daily cap.")
 
-                def sector_for(rec: Dict[str, Any]) -> str:
+                def sector_for(rec: Dict[str, Any]) -> Tuple[str, bool]:
                     if pitch_choice != AUTO_SECTOR:
-                        return pitch_choice
-                    return guess_sector(rec.get("Company") or "", rec.get("Industry") or "", rec.get("Description") or "")
+                        return pitch_choice, False
+                    return rec.get("_sector") or guess_sector(rec.get("Company") or "", rec.get("Industry") or ""), True
 
                 batch_to_run: List[Dict[str, Any]] = []
                 website_override = ""
-                queued = st.session_state.get("queue", {})
                 if not selected:
+                    fresh = [r for r in recs if not _done(r) and r["id"] not in queued]
+                    n_next = min(len(fresh), batch_size)
                     render_html(
                         f'<div class="pe-hint">{icon("pointer", 16)}'
-                        "Tick one lead, or several to build a batch. Or enrich everything shown in one go.</div>"
+                        f"{len(fresh):,} fresh {'lead' if len(fresh) == 1 else 'leads'} in this view. Enrich the next"
+                        f" {n_next} in one go, or tick specific leads.</div>"
                     )
-                    fresh = [r for r in recs if r["id"] not in log_now and r["id"] not in queued]
-                    if st.button(
-                        f"⚡ Enrich all {min(len(fresh), MAX_BATCH)} new leads"
-                        + (f" (skips {len(recs) - len(fresh)} already contacted or queued)" if len(fresh) < len(recs) else ""),
-                        type="primary", disabled=not fresh, **FULL_WIDTH,
-                        help=f"Fills the gaps for every lead shown (up to {MAX_BATCH} at a time), then sorts them into Ready to email / No email below.",
-                    ):
-                        batch_to_run = fresh[:MAX_BATCH]
-                    if len(fresh) > MAX_BATCH:
-                        st.caption(f"The first {MAX_BATCH} will be enriched. Run it again for the next {MAX_BATCH}.")
+                    if st.button(f"⚡ Enrich the next {n_next} leads", type="primary", disabled=not fresh, **FULL_WIDTH,
+                                 help="Finds contacts for the next batch in the order shown, then sorts them into"
+                                      " Ready to email / No email below. Tomorrow's batch carries on from here."):
+                        batch_to_run = fresh[:batch_size]
                 else:
                     n_sel = len(selected)
                     first_name = selected[0].get("Company") or _full_name(selected[0])
@@ -4211,11 +4487,11 @@ with col_left:
                         f'{esc(first_name) if n_sel == 1 else f"{n_sel} leads selected"}</div>'
                         f'<div class="m">{meta}</div></div>{chip(f"{n_sel} selected", "accent")}</div>'
                     )
-                    contacted_sel = [r for r in selected if r["id"] in log_now]
-                    if contacted_sel:
-                        st.caption(f"⚠️ {len(contacted_sel)} of these already contacted: "
-                                   + ", ".join((r.get("Company") or _full_name(r)) for r in contacted_sel[:4])
-                                   + ("…" if len(contacted_sel) > 4 else ""))
+                    worked = [r for r in selected if _done(r)]
+                    if worked:
+                        st.caption(f"⚠️ {len(worked)} of these already worked: "
+                                   + ", ".join((r.get("Company") or _full_name(r)) for r in worked[:4])
+                                   + ("…" if len(worked) > 4 else ""))
                     if n_sel > MAX_BATCH:
                         st.warning(f"Batches are capped at {MAX_BATCH} leads. Only the first {MAX_BATCH} will be enriched.")
                     if n_sel == 1:
@@ -4887,7 +5163,7 @@ if queue:
                              help="Re-scrapes the selected firms whose website you've changed."):
                     run_crm_enrichment(
                         [dict(queue[c]["lead"].crm_original or {}, id=queue[c]["lead"].crm_id) for c in retry_ids],
-                        lambda rec, _v={c: queue[c]["vertical"] for c in retry_ids}: _v.get(str(rec.get("id")), "General Business"),
+                        lambda rec, _v={c: queue[c]["vertical"] for c in retry_ids}: (_v.get(str(rec.get("id")), "General Business"), False),
                         manual_websites={c: queue[c]["website_input"] for c in retry_ids},
                     )
                     st.rerun()
