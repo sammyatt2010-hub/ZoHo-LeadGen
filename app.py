@@ -2625,6 +2625,12 @@ ZOHO_LEAD_FIELDS = [
     "Email_Opt_Out", "Created_Time", "Modified_Time", "Last_Activity_Time", "Description",
 ]
 ZOHO_MAX_LEADS = 2000
+ZOHO_SEND_LIMIT = 100  # Zoho's Send Mail API allows 100 emails a day
+ZOHO_SCOPE = ("ZohoCRM.modules.leads.ALL,ZohoCRM.modules.notes.CREATE,ZohoCRM.coql.READ,"
+              "ZohoCRM.settings.fields.READ,ZohoCRM.org.READ,ZohoCRM.send_mail.leads.CREATE,"
+              "ZohoCRM.Files.CREATE,ZohoCRM.settings.emails.READ")
+ZOHO_FIELD_API = {"Website": "Website", "Phone": "Phone", "Email": "Email",
+                  "First Name": "First_Name", "Last Name": "Last_Name", "Title": "Designation"}
 
 
 class ZohoError(RuntimeError):
@@ -2718,7 +2724,9 @@ class ZohoCRM:
             if resp.status_code == 401 and code in ("INVALID_TOKEN", "AUTHENTICATION_FAILURE") and attempt == 0:
                 continue  # Token expired early: refresh once and retry
             if resp.status_code >= 400:
-                msg = body.get("message") or code or f"HTTP {resp.status_code}"
+                row = (body.get("data") or [{}])[0] if isinstance(body.get("data"), list) else {}
+                code = code or str(row.get("code", ""))
+                msg = body.get("message") or row.get("message") or code or f"HTTP {resp.status_code}"
                 if code == "OAUTH_SCOPE_MISMATCH":
                     msg = "The Zoho token is missing a permission. Regenerate it with the scopes listed in the setup notes."
                 raise ZohoError(f"Zoho CRM error: {msg}")
@@ -2760,6 +2768,46 @@ class ZohoCRM:
                 break
             offset += 200
         return out
+
+    # ---------- writes (phase 2): send, fill blanks, notes ----------
+    @staticmethod
+    def _row_result(body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        row = ((body or {}).get("data") or [{}])[0]
+        if row.get("status") != "success":
+            msg = row.get("message") or row.get("code") or "unknown error"
+            raise ZohoError(f"Zoho CRM error: {msg}")
+        return row.get("details") or {}
+
+    def from_addresses(self) -> List[Dict[str, Any]]:
+        body = self._request("GET", "/crm/v8/settings/emails/actions/from_addresses") or {}
+        return [a for a in body.get("from_addresses", []) if a.get("email")]
+
+    def upload_file(self, filename: str, data: bytes) -> str:
+        body = self._request("POST", "/crm/v8/files", files={"file": (filename, data, "application/pdf")})
+        return self._row_result(body)["id"]
+
+    def send_mail(self, record_id: str, sender: Dict[str, Any], to_email: str, to_name: str,
+                  subject: str, html: str, attachment_ids: Optional[List[str]] = None) -> str:
+        mail: Dict[str, Any] = {
+            "from": {"user_name": sender.get("user_name") or "", "email": sender["email"]},
+            "to": [{"user_name": to_name or "", "email": to_email}],
+            "subject": subject, "content": html, "mail_format": "html",
+        }
+        if sender.get("type") == "org_email":
+            mail["org_email"] = True
+        if attachment_ids:
+            mail["attachments"] = [{"id": a} for a in attachment_ids]
+        body = self._request("POST", f"/crm/v8/Leads/{record_id}/actions/send_mail", json={"data": [mail]})
+        return self._row_result(body).get("message_id", "")
+
+    def update_lead(self, record_id: str, fields: Dict[str, Any]) -> None:
+        if fields:
+            self._row_result(self._request("PUT", "/crm/v8/Leads", json={"data": [dict(fields, id=record_id)]}))
+
+    def add_note(self, record_id: str, title: str, content: str) -> None:
+        note = {"Note_Title": title, "Note_Content": content,
+                "Parent_Id": {"module": {"api_name": "Leads"}, "id": record_id}}
+        self._row_result(self._request("POST", f"/crm/v8/Leads/{record_id}/Notes", json={"data": [note]}))
 
     def record_url(self, record_id: str) -> str:
         dom = st.session_state.get("zoho_org_domain")
@@ -3335,6 +3383,137 @@ def run_crm_enrichment(
                    " or research. See Review & send below.")
 
 
+# ------------------------------------------------------------------
+# SEND VIA ZOHO (phase 2): send, fill blanks, add a note, move the Lead Status on
+# ------------------------------------------------------------------
+def zoho_sent_today(log: Dict[str, Any]) -> int:
+    today = now_uk().date().isoformat()
+    return sum(1 for r in log.values() if r.get("via") == "zoho" and str(r.get("sent_at", "")).startswith(today))
+
+
+def zoho_senders() -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Addresses Zoho lets us send from (cached). Returns (addresses, error)."""
+    if "zoho_from" not in st.session_state:
+        try:
+            st.session_state["zoho_from"] = ZOHO.from_addresses()
+        except ZohoError as exc:
+            return [], str(exc)
+    return st.session_state["zoho_from"], None
+
+
+def zoho_send_choice() -> Tuple[Optional[Dict[str, Any]], Optional[str], bool]:
+    """(from address, status to set after sending, prepare-only) as chosen in the Send via Zoho panel."""
+    senders, _ = zoho_senders()
+    idx = st.session_state.get("zs_from", 0)
+    sender = senders[idx] if senders and isinstance(idx, int) and idx < len(senders) else (senders[0] if senders else None)
+    status = st.session_state.get("zs_status", ZS_DEFAULT_STATUS)
+    statuses = ZOHO.lead_statuses(st.session_state.get("zoho_fields") or {})
+    if status == ZS_DEFAULT_STATUS:
+        status = next((s for s in statuses if s.lower() == "attempted to contact"), None)
+    elif status == ZS_NO_CHANGE:
+        status = None
+    return sender, status, bool(st.session_state.get("zs_prepare", False))
+
+
+ZS_DEFAULT_STATUS = "Attempted to Contact (recommended)"
+ZS_NO_CHANGE = "Don't change it"
+
+
+def push_to_zoho(ids: List[str], sender: Optional[Dict[str, Any]], new_status: Optional[str], prepare_only: bool,
+                 origin: str = "panel") -> None:
+    """Sends each lead's email through Zoho (or just prepares it), then fills blank fields and adds a note.
+    Results go into st.session_state['zoho_push_result'] for display after the rerun."""
+    done, problems = [], []
+    sent_changes: Dict[str, Optional[Dict[str, Any]]] = {}
+    who = get_sender().get("name") or "Lead Revival"
+    stamp = now_uk().strftime("%d %b %Y %H:%M")
+    progress = st.progress(0.0, text="Talking to Zoho…")
+    for n, cn in enumerate(ids, start=1):
+        item = queue.get(cn)
+        if not item:
+            continue
+        lead: ScrapedLead = item["lead"]
+        name = lead_display_name(lead)
+        progress.progress(n / len(ids), text=f"{'Preparing' if prepare_only else 'Sending'} {n} of {len(ids)} · {name}")
+        if not lead.crm_id:
+            problems.append(f"{name}: not a Zoho lead")
+            continue
+        ensure_draft(item)
+        to = (item.get("to") or "").strip()
+        contact = infer_contact_name_and_role(lead, item["vertical"])[0]
+        if not prepare_only:
+            if lead.email_opt_out:
+                problems.append(f"{name}: opted out of email in Zoho, not sent")
+                continue
+            if not to or not clean_email(to):
+                problems.append(f"{name}: no valid email address")
+                continue
+            if not sender:
+                problems.append(f"{name}: no From address available in Zoho")
+                continue
+            try:
+                att = []
+                if st.session_state["opt_attach"]:
+                    pdf = create_sector_overview_pdf(lead, item["vertical"])
+                    att = [ZOHO.upload_file(f"SY_Communications_overview_{draft_filename_part(lead.company_name)}.pdf", pdf)]
+                ZOHO.send_mail(lead.crm_id, sender, to, "" if contact in ("Team", "there") else contact,
+                               item["subject"], _email_body_html(item["body"]), att)
+            except ZohoError as exc:
+                problems.append(f"{name}: not sent. {exc}")
+                continue
+        # Fill blanks + status + note. The email has gone by now, so a failure here is a warning, not a stop.
+        found = zoho_updates(lead, item)
+        fields = {ZOHO_FIELD_API[k]: v for k, v in found.items() if k in ZOHO_FIELD_API}
+        if new_status and not prepare_only:
+            fields["Lead_Status"] = new_status
+        if prepare_only:
+            note = (f"Pitch prepared by {who} on {stamp} (not sent yet).\nTo: {to or 'no address'}\n"
+                    f"Subject: {item['subject']}\n\n{item['body']}")
+            title = "Lead Revival: pitch ready to send"
+        else:
+            note = (f"Emailed by {who} via Lead Revival on {stamp}.\nTo: {to}\nSubject: {item['subject']}\n"
+                    f"Pitch: {item['vertical']}" + (" (overview PDF attached)" if st.session_state["opt_attach"] else ""))
+            title = "Lead Revival: pitch emailed"
+        if found:
+            note += "\nFilled in: " + ", ".join(f"{k} ({v})" for k, v in found.items())
+        others = [e for e in lead.emails_found if e != to and e != (lead.crm_original or {}).get("Email")]
+        if others:
+            note += "\nOther addresses found: " + ", ".join(others[:4])
+        try:
+            ZOHO.update_lead(lead.crm_id, fields)
+            lead.crm_original = dict(lead.crm_original or {}, **{k: v for k, v in fields.items()})
+            if "Lead_Status" in fields:
+                lead.crm_status = fields["Lead_Status"]
+        except ZohoError as exc:
+            problems.append(f"{name}: {'sent, but ' if not prepare_only else ''}fields not updated. {exc}")
+        try:
+            ZOHO.add_note(lead.crm_id, title, note)
+        except ZohoError as exc:
+            problems.append(f"{name}: note not added. {exc}")
+        if not prepare_only:
+            sent_changes[cn] = dict(sent_record(item), via="zoho", status="Emailed via Zoho",
+                                    from_address=sender.get("email") if sender else "")
+        done.append(name)
+    progress.empty()
+    if sent_changes:
+        record_sent(sent_changes)
+    st.session_state["zoho_push_result"] = {"done": done, "problems": problems, "prepare": prepare_only, "origin": origin}
+    bump_queue_editor()
+
+
+def show_zoho_push_result(origin: str = "panel") -> None:
+    res = st.session_state.get("zoho_push_result")
+    if not res or res.get("origin") != origin:
+        return
+    st.session_state.pop("zoho_push_result", None)
+    if res["done"]:
+        verb = "prepared in Zoho (not sent)" if res["prepare"] else "sent via Zoho"
+        st.success(f"{len(res['done'])} {'lead' if len(res['done']) == 1 else 'leads'} {verb}: "
+                   + ", ".join(res["done"][:6]) + ("…" if len(res["done"]) > 6 else ""))
+    for p in res["problems"]:
+        st.warning(p)
+
+
 def ensure_draft(item: Dict[str, Any]) -> None:
     """(Re)builds a firm's subject/body when first needed or when options/signature change."""
     sig = (item["vertical"], st.session_state["opt_attach"], st.session_state["opt_switch"],
@@ -3428,6 +3607,7 @@ with st.sidebar:
         st.session_state.pop("call_list_data", None)
         st.session_state.pop("contacts_data", None)
         st.session_state.pop("zoho_fields", None)
+        st.session_state.pop("zoho_from", None)
         st.session_state["call_ver"] = st.session_state.get("call_ver", 0) + 1
         st.session_state["sent_log_ver"] = st.session_state.get("sent_log_ver", 0) + 1
         bump_queue_editor()
@@ -3846,8 +4026,7 @@ def render_zoho_setup() -> None:
         "<b>2.</b> Paste the scope below, pick <b>10 minutes</b>, add any description and click <b>Create</b>.<br>"
         "<b>3.</b> Copy the code it shows (starts <b>1000.</b>), paste it here and click Connect. Be quick: codes expire.</div></div>"
     )
-    st.code("ZohoCRM.modules.leads.READ,ZohoCRM.coql.READ,ZohoCRM.settings.fields.READ,ZohoCRM.org.READ",
-            language=None)
+    st.code(ZOHO_SCOPE, language=None)
     with st.form("zoho_setup", border=False):
         zc1, zc2 = columns([2.2, 1])
         with zc1:
@@ -4362,6 +4541,26 @@ with col_right:
                         **FULL_WIDTH,
                     )
 
+                # Send this one lead through Zoho (uses the From/Status chosen under Review & send)
+                if lead.crm_id and not lead.email_opt_out and not is_sent:
+                    zs_sender, zs_status, _ = zoho_send_choice()
+                    try:
+                        zpop = st.popover("🚀  Send this email via Zoho", key=f"zs1_{cn}_{st.session_state.get('sent_log_ver', 0)}",
+                                          disabled=not email_to, **FULL_WIDTH)
+                    except TypeError:
+                        zpop = st.popover("🚀  Send this email via Zoho", disabled=not email_to, **FULL_WIDTH)
+                    with zpop:
+                        if not zs_sender:
+                            st.caption("Set up sending under Review & send first (Send via Zoho).")
+                        else:
+                            st.markdown(f"Send to **{esc(email_to)}** from **{esc(zs_sender['email'])}**?")
+                            st.caption("Logged on the Zoho lead, with a note"
+                                       + (f"; Lead Status becomes {zs_status}." if zs_status else "."))
+                            if st.button("Yes, send it now", type="primary", key=f"zs1_go_{cn}", **FULL_WIDTH):
+                                push_to_zoho([cn], zs_sender, zs_status, False, origin="dossier")
+                                st.rerun()
+                show_zoho_push_result("dossier")
+
                 # Sent tick: saved to the permanent log, so it's there next time anyone opens the app
                 sent_now = st.checkbox(
                     "✅  Handled: tick once this email has gone",
@@ -4465,6 +4664,75 @@ def _apply_editor(edited: pd.DataFrame, log_now: Dict[str, Any]) -> None:
         st.rerun()
 
 
+
+def render_zoho_send_panel(ready_sel: List[str], log_now: Dict[str, Any]) -> None:
+    """Send the selected Ready-to-email leads through Zoho CRM, logged on each lead."""
+    with st.container(key="card-zoho-send"):
+        render_html(
+            '<div style="display:flex;align-items:center;gap:10px;margin:4px 0 2px 0">'
+            f'<span style="font-weight:700;color:var(--text)">🚀 Send via Zoho</span>{chip("Logged on each lead", "accent")}</div>'
+            '<div style="font-size:.8rem;color:var(--muted);margin-bottom:6px">Sends each email from Zoho CRM with its PDF,'
+            " fills blank fields, adds a note and moves the Lead Status on.</div>"
+        )
+        senders, err = zoho_senders()
+        if err:
+            if "permission" in err.lower() or "scope" in err.lower():
+                st.info("Sending needs extra Zoho permissions (a one-off). Generate a new code with the scope below"
+                        " and connect again, then replace ZOHO_REFRESH_TOKEN in Secrets and reboot.")
+                with st.expander("Upgrade Zoho permissions", expanded=False):
+                    render_zoho_setup()
+            else:
+                st.error(err)
+                if st.button("Try again", key="zs_retry"):
+                    st.session_state.pop("zoho_from", None)
+                    st.rerun()
+            return
+        if not senders:
+            st.warning("Zoho didn't return any address to send from. Check your email settings in Zoho CRM.")
+            return
+        statuses = ZOHO.lead_statuses(st.session_state.get("zoho_fields") or {})
+        status_opts = ([ZS_DEFAULT_STATUS] if any(s.lower() == "attempted to contact" for s in statuses) else []) \
+            + [s for s in statuses if s.lower() != "attempted to contact"] + [ZS_NO_CHANGE]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.selectbox("Send from", list(range(len(senders))), key="zs_from",
+                         format_func=lambda i: f"{senders[i].get('user_name') or ''} <{senders[i]['email']}>".strip()
+                         + (" · org address" if senders[i].get("type") == "org_email" else ""),
+                         help="Addresses your Zoho account can send from. Replies come back to this address.")
+        with c2:
+            st.selectbox("Then set Lead Status to", status_opts, key="zs_status")
+        st.toggle("Prepare only: update Zoho and add the pitch as a note, but don't send", key="zs_prepare",
+                  help="For when someone wants to check the pitch in Zoho first.")
+        prepare_only = bool(st.session_state.get("zs_prepare"))
+        sent_today = zoho_sent_today(log_now)
+        left = max(0, ZOHO_SEND_LIMIT - sent_today)
+        ids = [c for c in ready_sel if not queue[c]["lead"].email_opt_out]
+        if not prepare_only and len(ids) > left:
+            st.warning(f"Zoho allows {ZOHO_SEND_LIMIT} emails a day and {sent_today} have gone today,"
+                       f" so only the first {left} will be sent.")
+            ids = ids[:left]
+        label = (f"📝  Prepare {len(ids)} in Zoho" if prepare_only
+                 else f"🚀  Send {len(ids)} {'email' if len(ids) == 1 else 'emails'} via Zoho")
+        pop_kwargs = dict(disabled=not ids, **FULL_WIDTH)
+        try:
+            pop = st.popover(label, key=f"zs_pop_{st.session_state.get('sent_log_ver', 0)}", **pop_kwargs)
+        except TypeError:
+            pop = st.popover(label, **pop_kwargs)
+        with pop:
+            sender, status, _ = zoho_send_choice()
+            if prepare_only:
+                st.markdown(f"Update **{len(ids)} leads** in Zoho and add each pitch as a note? Nothing is emailed.")
+            else:
+                st.markdown(f"Send **{len(ids)} emails** now from **{esc(sender['email']) if sender else '?'}**?")
+                st.caption("This can't be undone. Each email is logged on its Zoho lead"
+                           + (f", and the Lead Status becomes {status}." if status else "."))
+            if st.button("Yes, prepare them" if prepare_only else "Yes, send them now", type="primary",
+                         key="zs_confirm", **FULL_WIDTH):
+                push_to_zoho(ids, sender, status, prepare_only)
+                st.rerun()
+        st.caption(f"Sent via Zoho today: {sent_today} of {ZOHO_SEND_LIMIT}.")
+
+
 def _group_title(emoji: str, title: str, count: int, tone: str) -> None:
     render_html(
         f'<div style="display:flex;align-items:center;gap:10px;margin:18px 0 8px 0">'
@@ -4492,6 +4760,7 @@ if queue:
 
         # ===== 1. Ready to email =====
         _group_title("✉️", "Ready to email", len(ready_all), "good")
+        show_zoho_push_result()
         if not ready_all:
             st.caption("No firms with an email address yet. Check the No email found list below.")
         else:
@@ -4541,6 +4810,7 @@ if queue:
                     st.button("📦  Select firms to export", disabled=True, **FULL_WIDTH)
             with r2:
                 _mark_handled_popover(ready_sel, "firms", "pop_ready")
+            render_zoho_send_panel(ready_sel, log_now)
 
         # ===== 2. No email found =====
         _group_title("📞", "No email found", len(noemail_all), "warn")
