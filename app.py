@@ -580,6 +580,7 @@ class OfficerInfo(BaseModel):
     role: str  # Friendly label, e.g. "Director"
     raw_role: str = ""  # Companies House value, e.g. "llp-designated-member"
     appointed_on: Optional[str] = None
+    is_owner: bool = False  # Also a Person with Significant Control
 
 
 class ScrapedLead(BaseModel):
@@ -701,10 +702,23 @@ def domain_of(url: str) -> Optional[str]:
     return host[4:] if host.startswith("www.") else host or None
 
 
+FOREIGN_OK_TLDS = {"uk", "co", "io", "me", "ai", "tv", "eu", "ly", "fm", "cc"}
+BLOCKED_DOMAINS |= {
+    "zhihu.com", "baidu.com", "quora.com", "reddit.com", "medium.com", "weibo.com", "bilibili.com", "vk.com",
+    "naver.com", "yahoo.com", "msn.com", "imdb.com", "booking.com", "expedia.co.uk", "trivago.co.uk",
+    "github.com", "apple.com", "microsoft.com", "wikimedia.org", "wiktionary.org", "britannica.com",
+    "find-open.co.uk", "yably.co.uk", "locallife.co.uk", "companieshousedata.co.uk", "ukbusinessforums.co.uk",
+    "bizstats.co.uk", "companydatashop.com", "checkcompany.uk", "find-and-update.company-information.service.gov.uk",
+}
+
+
 def is_blocked_domain(domain: str) -> bool:
     domain = domain.lower()
     if domain in BLOCKED_EXACT_ONLY:
         return True
+    tld = domain.rsplit(".", 1)[-1]
+    if len(tld) == 2 and tld not in FOREIGN_OK_TLDS:
+        return True  # Another country's site (.cn, .de, .ru…): never a UK firm's own website
     return any(domain == b or domain.endswith("." + b) for b in BLOCKED_DOMAINS)
 
 
@@ -1249,6 +1263,7 @@ class LeadEnricher:
         postcode: Optional[str] = None,
         places_website: Optional[str] = None,
         trading_name: Optional[str] = None,
+        listing_source: str = "Google Maps",
     ) -> Dict[str, Any]:
         """Finds the firm's own website. Returns url, confidence, reasons and notes."""
         places_domain = domain_of(places_website) if places_website else None
@@ -1259,7 +1274,8 @@ class LeadEnricher:
 
         # A. Search engines (DuckDuckGo, then Bing as a fallback)
         search_urls: List[str] = []
-        for engine in (self._search_duckduckgo, self._search_bing):
+        engines = () if places_domain else (self._search_duckduckgo, self._search_bing)  # Listed site: no need to search
+        for engine in engines:
             urls, err = engine(query)
             if err:
                 notes.append(err)
@@ -1307,7 +1323,7 @@ class LeadEnricher:
             on_listing = bool(places_domain and final_domain in (places_domain, "www." + places_domain))
             if on_listing:
                 score += 35
-                reasons = ["website on the firm's Google Maps listing"] + reasons
+                reasons = [f"website on the firm's {listing_source} listing"] + reasons
             elif domain in guessed_only:
                 # A guessed address (e.g. elliott.com) must prove it's this firm: a matching name in the
                 # web address or page title isn't enough, since big unrelated sites share common names.
@@ -1325,10 +1341,10 @@ class LeadEnricher:
 
         if not results:
             if places_website and places_domain and not is_blocked_domain(places_domain):
-                notes.append("Website didn't respond to us, but it's on the firm's Google Maps listing")
+                notes.append(f"Website didn't respond to us, but it's on the firm's {listing_source} listing")
                 parsed_p = urlparse(places_website if "://" in places_website else "https://" + places_website)
                 return {"url": f"{parsed_p.scheme}://{parsed_p.netloc}", "confidence": "Medium",
-                        "reasons": ["website on the firm's Google Maps listing"], "notes": notes}
+                        "reasons": [f"website on the firm's {listing_source} listing"], "notes": notes}
             if rejected_guesses:
                 notes.append("Ignored " + ", ".join(sorted(set(rejected_guesses))[:3])
                              + ": nothing on the site ties it to this company")
@@ -1526,6 +1542,266 @@ class LeadEnricher:
 
 
 # ==========================================
+# FREE INTELLIGENCE: no-cost sources tried before Google Maps
+#   Companies House owners (PSC) · FCA & SRA registers · OpenStreetMap · DNS email checks
+# ==========================================
+FREE_HEADERS = {"User-Agent": "SYComms-ProspectEngine/1.0 (+https://www.sycomms.co.uk; hello@sycomms.co.uk)"}
+_FREE_CACHE: Dict[str, Any] = {}
+FCA_SECTORS = {"Financial Advisers & Mortgage Brokers", "Insurance Brokers"}
+SRA_SECTORS = {"Solicitors & Legal Practices"}
+CQC_SECTORS = {"Care Homes & Home Care", "General Medical Clinics", "Dental Practices"}
+# Where a person can double-check a firm by hand (registers without a usable free search API)
+REGISTER_LINKS = {
+    "Care Homes & Home Care": ("CQC register", "https://www.cqc.org.uk/search/all?query={q}"),
+    "General Medical Clinics": ("CQC register", "https://www.cqc.org.uk/search/all?query={q}"),
+    "Dental Practices": ("CQC register", "https://www.cqc.org.uk/search/all?query={q}"),
+    "Financial Advisers & Mortgage Brokers": ("FCA register", "https://register.fca.org.uk/s/search?q={q}&type=Companies"),
+    "Insurance Brokers": ("FCA register", "https://register.fca.org.uk/s/search?q={q}&type=Companies"),
+    "Solicitors & Legal Practices": ("SRA register", "https://www.sra.org.uk/consumers/register/"),
+    "Veterinary Practices": ("RCVS Find a Vet", "https://findavet.rcvs.org.uk/find-a-vet-practice/?filter-keyword={q}"),
+}
+
+
+def register_link(sector: str, company: str) -> Optional[Tuple[str, str]]:
+    entry = REGISTER_LINKS.get(sector)
+    if not entry:
+        return None
+    return entry[0], entry[1].format(q=quote_plus(friendly_company_name(company)))
+
+
+def _sim(a: str, b: str) -> float:
+    ta, tb = set(distinctive_name_tokens(a or "")), set(distinctive_name_tokens(b or ""))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta), len(tb))
+
+
+def _free_get_json(url: str, **kwargs) -> Optional[Any]:
+    try:
+        resp = requests.get(url, headers={**FREE_HEADERS, **kwargs.pop("headers", {})}, timeout=kwargs.pop("timeout", 10), **kwargs)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+
+
+def postcode_location(postcode: str) -> Optional[Tuple[float, float]]:
+    """Latitude/longitude of a UK postcode (postcodes.io, free, no key)."""
+    pc = (postcode or "").replace(" ", "").upper()
+    if not pc:
+        return None
+    key = f"pc:{pc}"
+    if key not in _FREE_CACHE:
+        data = _free_get_json(f"https://api.postcodes.io/postcodes/{pc}")
+        res = (data or {}).get("result") or {}
+        _FREE_CACHE[key] = (res["latitude"], res["longitude"]) if res.get("latitude") else None
+    return _FREE_CACHE[key]
+
+
+def dns_has(domain: str, rtype: str) -> Optional[bool]:
+    """True/False if the domain has records of this type (Google DNS-over-HTTPS, free). None if unknown."""
+    key = f"dns:{domain}:{rtype}"
+    if key not in _FREE_CACHE:
+        data = _free_get_json("https://dns.google/resolve", params={"name": domain, "type": rtype}, timeout=6)
+        if data is None:
+            _FREE_CACHE[key] = None
+        elif data.get("Status") == 3:  # NXDOMAIN: the domain doesn't exist
+            _FREE_CACHE[key] = False
+        else:
+            _FREE_CACHE[key] = any(a.get("type") in (15 if rtype == "MX" else 1, 5) for a in (data.get("Answer") or []))
+    return _FREE_CACHE[key]
+
+
+def email_domain_ok(email: str) -> Optional[bool]:
+    """Can this address receive mail? False only when DNS says the domain has no mail server at all."""
+    domain = (email or "").rsplit("@", 1)[-1].lower()
+    if not domain:
+        return False
+    mx = dns_has(domain, "MX")
+    if mx is not False:
+        return mx
+    return dns_has(domain, "A")  # Mail can still be delivered to the domain's A record
+
+
+def filter_deliverable(emails: List[str]) -> Tuple[List[str], List[str]]:
+    """(kept, dropped): drops addresses whose domain can't receive email (typos, dead domains)."""
+    kept, dropped = [], []
+    for e in emails:
+        (dropped if email_domain_ok(e) is False else kept).append(e)
+    return kept, dropped
+
+
+def osm_lookup(company: str, postcode: str, trading_name: str = "") -> Optional[Dict[str, Any]]:
+    """The business on OpenStreetMap near its postcode (Overpass API, free, no key)."""
+    loc = postcode_location(postcode)
+    tokens = [t for t in distinctive_name_tokens(trading_name or company) if len(t) >= 4] or \
+             distinctive_name_tokens(trading_name or company)
+    if not loc or not tokens:
+        return None
+    token = re.escape(max(tokens, key=len))
+    query = (f'[out:json][timeout:12];nwr(around:3000,{loc[0]},{loc[1]})["name"~"{token}",i];out tags 20;')
+    key = f"osm:{query}"
+    if key not in _FREE_CACHE:
+        try:
+            resp = requests.post("https://overpass-api.de/api/interpreter", data={"data": query},
+                                 headers=FREE_HEADERS, timeout=15)
+            _FREE_CACHE[key] = resp.json().get("elements", []) if resp.status_code == 200 else None
+        except (requests.exceptions.RequestException, ValueError):
+            _FREE_CACHE[key] = None
+    elements = _FREE_CACHE[key]
+    if not elements:
+        return None
+    best, best_score = None, 0.0
+    for el in elements:
+        tags = el.get("tags") or {}
+        score = max(_sim(company, tags.get("name", "")), _sim(trading_name, tags.get("name", "")) if trading_name else 0)
+        if score > best_score:
+            best, best_score = tags, score
+    if not best or best_score < 0.5:
+        return None
+    site = best.get("website") or best.get("contact:website") or best.get("url") or ""
+    phone = best.get("phone") or best.get("contact:phone") or ""
+    email = best.get("email") or best.get("contact:email") or ""
+    if not (site or phone or email):
+        return None
+    return {"name": best.get("name", ""), "website": site, "phone": normalise_uk_phone(phone.split(";")[0]) or "",
+            "email": clean_email(email.split(";")[0]) if email else None, "source": "OpenStreetMap"}
+
+
+def _pick(d: Dict[str, Any], *words: str) -> str:
+    """First non-empty value whose key contains any of the words (register APIs vary their field names)."""
+    for k, v in (d or {}).items():
+        if any(w in k.lower() for w in words) and isinstance(v, (str, int)) and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def fca_lookup(company: str, postcode: str) -> Optional[Dict[str, Any]]:
+    """FCA Financial Services Register (free key: FCA_API_EMAIL + FCA_API_KEY in Secrets)."""
+    email, key = _secret_value("FCA_API_EMAIL"), _secret_value("FCA_API_KEY")
+    if not (email and key):
+        return None
+    hdr = {"X-Auth-Email": email, "X-Auth-Key": key, "Content-Type": "application/json"}
+    base = "https://register.fca.org.uk/services/V0.1"
+    data = _free_get_json(f"{base}/Search", params={"q": friendly_company_name(company), "type": "firm"}, headers=hdr)
+    rows = (data or {}).get("Data") or []
+    ranked = sorted(
+        [r for r in rows if "authorised" in _pick(r, "status").lower() or not _pick(r, "status")],
+        key=lambda r: -_sim(company, _pick(r, "name")))
+    for r in ranked[:3]:
+        if _sim(company, _pick(r, "name")) < 0.6:
+            break
+        frn = _pick(r, "reference number", "frn")
+        addr = _free_get_json(f"{base}/Firm/{frn}/Address", headers=hdr) if frn else None
+        offices = (addr or {}).get("Data") or []
+        pc = (postcode or "").replace(" ", "").upper()
+        office = next((o for o in offices if pc and _pick(o, "postcode").replace(" ", "").upper() == pc), None) \
+            or (offices[0] if offices else {})
+        site, phone = _pick(office, "website"), _pick(office, "phone")
+        if site or phone:
+            return {"name": _pick(r, "name"), "website": site, "phone": normalise_uk_phone(phone) or phone,
+                    "email": None, "source": f"FCA register (FRN {frn})"}
+    return None
+
+
+@st.cache_resource(ttl=86400, show_spinner="Downloading the SRA register (once a day)…")
+def sra_register() -> List[Dict[str, Any]]:
+    """Every SRA-regulated firm with its offices (free key: SRA_API_KEY in Secrets). Cached for a day."""
+    key = _secret_value("SRA_API_KEY")
+    if not key:
+        return []
+    try:
+        resp = requests.get("https://sra-prod-apim.azure-api.net/datashare/api/V1/organisation/GetAll",
+                            headers={"Ocp-Apim-Subscription-Key": key, **FREE_HEADERS}, timeout=90)
+        body = resp.json() if resp.status_code == 200 else {}
+    except (requests.exceptions.RequestException, ValueError):
+        body = {}
+    orgs = body.get("Organisations") or body.get("organisations") or (body if isinstance(body, list) else [])
+    return [o for o in orgs if isinstance(o, dict)]
+
+
+def sra_lookup(company: str, postcode: str, register: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not register:
+        return None
+    pc = (postcode or "").replace(" ", "").upper()
+    best, best_score, best_office = None, 0.0, {}
+    for org in register:
+        name = _pick(org, "practicename", "name")
+        score = _sim(company, name)
+        if score < 0.6:
+            continue
+        offices = org.get("Offices") or org.get("offices") or []
+        office = next((o for o in offices if pc and _pick(o, "postcode").replace(" ", "").upper() == pc), None)
+        if office:
+            score += 0.3
+        if score > best_score:
+            best, best_score, best_office = org, score, office or (offices[0] if offices else {})
+    if not best:
+        return None
+    site, phone, email = _pick(best_office, "website"), _pick(best_office, "phone"), _pick(best_office, "email")
+    if not (site or phone or email):
+        return None
+    return {"name": _pick(best, "practicename", "name"), "website": site, "phone": normalise_uk_phone(phone) or phone,
+            "email": clean_email(email) if email else None, "source": f"SRA register (SRA {_pick(best, 'sranumber')})"}
+
+
+def free_intel(company: str, postcode: str, sector: str, trading_name: str = "",
+               sra_data: Optional[List[Dict[str, Any]]] = None) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """Tries the free sources in order: the sector's register, then OpenStreetMap. Returns (found, notes)."""
+    notes: List[str] = []
+    found = None
+    if sector in FCA_SECTORS and _secret_value("FCA_API_KEY"):
+        found = fca_lookup(company, postcode)
+        notes.append(f"FCA register: matched '{found['name']}'" if found else "FCA register: no confident match")
+    elif sector in SRA_SECTORS and sra_data:
+        found = sra_lookup(company, postcode, sra_data)
+        notes.append(f"SRA register: matched '{found['name']}'" if found else "SRA register: no confident match")
+    if not found:
+        found = osm_lookup(company, postcode, trading_name)
+        if found:
+            notes.append(f"OpenStreetMap: matched '{found['name']}'")
+    if found and found.get("website") and not found["website"].startswith("http"):
+        found["website"] = "https://" + found["website"]
+    return found, notes
+
+
+def psc_owner_names(ch_api_key: str, company_number: str) -> List[str]:
+    """Active individual owners (People with Significant Control) from Companies House, as 'forename surname'."""
+    if not ch_api_key or not company_number:
+        return []
+    try:
+        resp = requests.get(
+            f"https://api.company-information.service.gov.uk/company/{company_number}/persons-with-significant-control",
+            auth=(ch_api_key, ""), timeout=10)
+        items = resp.json().get("items", []) if resp.status_code == 200 else []
+    except (requests.exceptions.RequestException, ValueError):
+        return []
+    out = []
+    for it in items:
+        if it.get("ceased_on") or "individual" not in (it.get("kind") or ""):
+            continue
+        ne = it.get("name_elements") or {}
+        name = " ".join(x for x in [ne.get("forename"), ne.get("surname")] if x) or it.get("name", "")
+        if name:
+            out.append(name.lower())
+    return out
+
+
+def mark_owners(officers: List[Any], owners: List[str]) -> List[Any]:
+    """Flags directors who are also owners, so the pitch goes to the person who signs things off."""
+    if not owners:
+        return officers
+    for o in officers:
+        disp = display_officer_name(o.name).lower().split()
+        if disp and any(disp[0] in own.split() and disp[-1] in own.split() for own in owners):
+            o.is_owner = True
+            if "owner" not in (o.role or "").lower():
+                o.role = f"{o.role} & owner"
+    return officers
+
+
+# ==========================================
 # 3. PITCH SYNTHESIZER & PDF BUILDER
 # ==========================================
 
@@ -1606,7 +1882,7 @@ def pick_decision_maker(officers: List["OfficerInfo"]) -> Optional["OfficerInfo"
     for wanted in DECISION_MAKER_ROLES:
         matches = [o for o in officers if o.raw_role == wanted]
         if matches:
-            return sorted(matches, key=lambda o: o.appointed_on or "9999")[0]
+            return sorted(matches, key=lambda o: (not getattr(o, "is_owner", False), o.appointed_on or "9999"))[0]
     return None
 
 
@@ -3470,7 +3746,7 @@ def _full_name(rec: Dict[str, Any]) -> str:
 
 
 def enrich_crm_lead(rec: Dict[str, Any], vertical: str, ch_key: str, manual_website: Optional[str] = None,
-                    auto_sector: bool = False) -> ScrapedLead:
+                    auto_sector: bool = False, sra_data: Optional[List[Dict[str, Any]]] = None) -> ScrapedLead:
     """Enriches one Zoho lead. What Zoho already knows comes first; we only add what's missing."""
     e = LeadEnricher(ch_api_key=ch_key)
     company = (rec.get("Company") or _full_name(rec) or "Unknown company").strip()
@@ -3480,7 +3756,7 @@ def enrich_crm_lead(rec: Dict[str, Any], vertical: str, ch_key: str, manual_webs
     # 1. Companies House (optional): company number, directors, registered address
     ch = find_company_by_name(e, company, town, postcode) if ch_key else None
     company_number = ch.get("company_number") if ch else None
-    officers = e.get_officers(company_number) if company_number else []
+    officers = mark_owners(e.get_officers(company_number), psc_owner_names(ch_key, company_number)) if company_number else []
     reg_address = ch.get("address_snippet") if ch else None
     sic_codes: List[str] = []
     if company_number:
@@ -3491,14 +3767,23 @@ def enrich_crm_lead(rec: Dict[str, Any], vertical: str, ch_key: str, manual_webs
     notes.append(f"Companies House: matched {ch.get('title')} (#{company_number})" if ch
                  else "Companies House: no confident match" if ch_key else "Companies House lookup not set up")
 
-    # 2. Google Maps (optional)
-    places = e.places_lookup(company, town or postcode, vertical)
-    if getattr(e, "last_places_note", None):
+    # 2. Free sources (sector register, OpenStreetMap), then Google Maps only if there are still gaps
+    crm_site = (rec.get("Website") or "").strip()
+    crm_phone = (rec.get("Phone") or rec.get("Mobile") or "").strip()
+    free, free_notes = (None, [])
+    if not (crm_site and crm_phone):
+        free, free_notes = free_intel(company, postcode, vertical, sra_data=sra_data)
+    notes += free_notes
+    have_site = bool(crm_site or (free and free.get("website")))
+    have_phone = bool(crm_phone or (free and free.get("phone")))
+    places = e.places_lookup(company, town or postcode, vertical) if not (have_site and have_phone) else None
+    if not (have_site and have_phone) and getattr(e, "last_places_note", None):
         notes.append(e.last_places_note)
+    elif have_site and have_phone:
+        notes.append("Google Maps: not needed (Zoho or free sources had the website and phone)")
     trading = places["name"] if places and places.get("name") else None
 
     # 3. Website: Zoho's own value wins, otherwise discover and verify
-    crm_site = (rec.get("Website") or "").strip()
     if manual_website:
         site_url = manual_website.strip()
         target = site_url if site_url.startswith("http") else f"https://{site_url}"
@@ -3507,9 +3792,11 @@ def enrich_crm_lead(rec: Dict[str, Any], vertical: str, ch_key: str, manual_webs
         target = crm_site if crm_site.startswith("http") else f"https://{crm_site}"
         confidence, reasons = "From CRM", ["website already in Zoho"]
     else:
+        listed_site, listed_source = (places.get("website"), "Google Maps") if places and places.get("website") else (
+            (free["website"], free["source"]) if free and free.get("website") else (None, "Google Maps"))
         d = e.auto_discover_website(company, location=town or postcode, company_number=company_number,
-                                    postcode=postcode, places_website=places.get("website") if places else None,
-                                    trading_name=trading)
+                                    postcode=postcode, places_website=listed_site,
+                                    trading_name=trading, listing_source=listed_source)
         target, confidence, reasons = d.get("url"), d.get("confidence"), d.get("reasons", [])
         notes += d.get("notes", [])
     site = e.scrape_contact_channels(target) if target else {
@@ -3517,9 +3804,19 @@ def enrich_crm_lead(rec: Dict[str, Any], vertical: str, ch_key: str, manual_webs
 
     # 4. Channels: Zoho first, then Google, then the website
     crm_email = clean_email(rec.get("Email") or "") if rec.get("Email") else None
-    emails = ([crm_email] if crm_email else []) + [x for x in site["emails"] if x != crm_email]
+    free_email = free.get("email") if free else None
+    found = [x for x in ([free_email] if free_email else []) + site["emails"] if x and x != crm_email]
+    found, dead = filter_deliverable(list(dict.fromkeys(found)))
+    if dead:
+        notes.append("Dropped (domain can't receive email): " + ", ".join(dead[:3]))
+    emails = ([crm_email] if crm_email else []) + found
+    owners = [display_officer_name(o.name) for o in officers if getattr(o, "is_owner", False)]
+    if owners:
+        notes.append("Companies House: " + ", ".join(owners[:2]) + (" is" if len(owners) == 1 else " are")
+                     + " a director and owner")
     phones: List[str] = []
-    for raw in [rec.get("Phone"), rec.get("Mobile"), places.get("phone") if places else None] + site["phones"]:
+    for raw in [rec.get("Phone"), rec.get("Mobile"), free.get("phone") if free else None,
+                places.get("phone") if places else None] + site["phones"]:
         ph = normalise_uk_phone(raw or "") or ((raw or "").strip() if raw and raw in (rec.get("Phone"), rec.get("Mobile")) else None)
         if ph and ph not in phones:
             phones.append(ph)
@@ -3970,10 +4267,14 @@ def run_crm_enrichment(
     manual_websites = manual_websites or {}
     progress = st.progress(0.0, text="Starting enrichment…")
 
+    sectors = {sector_for(r)[0] for r in recs}
+    sra_data = sra_register() if (sectors & SRA_SECTORS) and _secret_value("SRA_API_KEY") else []
+
     def _enrich(rec: Dict[str, Any]) -> ScrapedLead:
         rid = str(rec.get("id"))
         sector, auto = sector_for(rec)
-        return enrich_crm_lead(rec, sector, ch_api_key, manual_website=manual_websites.get(rid) or None, auto_sector=auto)
+        return enrich_crm_lead(rec, sector, ch_api_key, manual_website=manual_websites.get(rid) or None,
+                               auto_sector=auto, sra_data=sra_data)
 
     results: Dict[str, ScrapedLead] = {}
     failures: List[str] = []
@@ -4226,6 +4527,15 @@ with st.sidebar:
     render_html(f'<div class="pe-status">Call list<span class="st {call_state}</span></div>')
     places_state = 'ok">Connected' if _secret_value("GOOGLE_PLACES_API_KEY") else 'idle">Not set up'
     render_html(f'<div class="pe-status">Google Maps lookup<span class="st {places_state}</span></div>')
+    fca_state = 'ok">Connected' if _secret_value("FCA_API_KEY") and _secret_value("FCA_API_EMAIL") else 'idle">Add free key'
+    sra_state = 'ok">Connected' if _secret_value("SRA_API_KEY") else 'idle">Add free key'
+    render_html(
+        '<div class="pe-status">OpenStreetMap<span class="st ok">Free · ready</span></div>'
+        '<div class="pe-status">Email domain checks<span class="st ok">Free · ready</span></div>'
+        '<div class="pe-status">Owners (Companies House)<span class="st ok">Free · ready</span></div>'
+        f'<div class="pe-status">FCA register<span class="st {fca_state}</span></div>'
+        f'<div class="pe-status">SRA register<span class="st {sra_state}</span></div>'
+    )
     if SENT_LOG.last_error or st.session_state.get("sent_log_error"):
         st.caption("⚠️ " + (st.session_state.pop("sent_log_error", None) or SENT_LOG.last_error or ""))
     elif SENT_LOG.backend == "local":
@@ -5183,6 +5493,11 @@ with col_right:
                     "Weak website match. Check it's the right firm before sending, or tick just this"
                     " lead on the left, paste the correct website and re-run."
                 )
+
+            reg = register_link(current_vert_name, lead.company_name)
+            if reg:
+                st.link_button(f"🔎 Check on the {reg[0]} ↗", reg[1],
+                               help="Official register: confirms the firm and often lists its website, phone and manager.")
 
             tab1, tab2 = st.tabs(["Overview", "Pitch & send"])
 
