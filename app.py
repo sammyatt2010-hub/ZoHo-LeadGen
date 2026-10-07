@@ -3954,10 +3954,27 @@ for _k, _v in {"opt_branded": True, "opt_attach": True, "opt_switch": True, "que
     st.session_state.setdefault(_k, _v)
 
 
+def save_log_quietly(store: "SentLog", changes: Dict[str, Any], message: str) -> None:
+    """Used when the page is stopping mid-send (e.g. someone switched page): Streamlit calls aren't allowed then,
+    so save straight to GitHub and flag every session to reload the log on its next run."""
+    import sys as _sys
+    try:
+        store.apply(changes, message)
+    except Exception:
+        return
+    _sys._sy_log_epoch = getattr(_sys, "_sy_log_epoch", 0) + 1
+
+
+def _log_epoch() -> int:
+    import sys as _sys
+    return getattr(_sys, "_sy_log_epoch", 0)
+
+
 def get_sent_log() -> Dict[str, Any]:
     """Loaded once per session; refreshed after every change (and by the sidebar Refresh button)."""
-    if "sent_log_data" not in st.session_state:
+    if "sent_log_data" not in st.session_state or st.session_state.get("sent_log_data_epoch") != _log_epoch():
         st.session_state["sent_log_data"] = SENT_LOG.load()
+        st.session_state["sent_log_data_epoch"] = _log_epoch()
     return st.session_state["sent_log_data"]
 
 
@@ -4357,72 +4374,85 @@ def push_to_zoho(ids: List[str], sender: Optional[Dict[str, Any]], new_status: O
     who = get_sender().get("name") or "Lead Revival"
     stamp = now_uk().strftime("%d %b %Y %H:%M")
     progress = st.progress(0.0, text="Talking to Zoho…")
-    for n, cn in enumerate(ids, start=1):
-        item = queue.get(cn)
-        if not item:
-            continue
-        lead: ScrapedLead = item["lead"]
-        name = lead_display_name(lead)
-        progress.progress(n / len(ids), text=f"{'Preparing' if prepare_only else 'Sending'} {n} of {len(ids)} · {name}")
-        if not lead.crm_id:
-            problems.append(f"{name}: not a Zoho lead")
-            continue
-        ensure_draft(item)
-        to = (item.get("to") or "").strip()
-        contact = infer_contact_name_and_role(lead, item["vertical"])[0]
-        if not prepare_only:
-            if lead.email_opt_out:
-                problems.append(f"{name}: opted out of email in Zoho, not sent")
+    try:
+        for n, cn in enumerate(ids, start=1):
+            item = queue.get(cn)
+            if not item:
                 continue
-            if not to or not clean_email(to):
-                problems.append(f"{name}: no valid email address")
+            lead: ScrapedLead = item["lead"]
+            name = lead_display_name(lead)
+            progress.progress(n / len(ids), text=f"{'Preparing' if prepare_only else 'Sending'} {n} of {len(ids)} · {name}")
+            if not lead.crm_id:
+                problems.append(f"{name}: not a Zoho lead")
                 continue
-            if not sender:
-                problems.append(f"{name}: no From address available in Zoho")
-                continue
+            ensure_draft(item)
+            to = (item.get("to") or "").strip()
+            contact = infer_contact_name_and_role(lead, item["vertical"])[0]
+            if not prepare_only:
+                if lead.email_opt_out:
+                    problems.append(f"{name}: opted out of email in Zoho, not sent")
+                    continue
+                if not to or not clean_email(to):
+                    problems.append(f"{name}: no valid email address")
+                    continue
+                if not sender:
+                    problems.append(f"{name}: no From address available in Zoho")
+                    continue
+                try:
+                    att = []
+                    if st.session_state["opt_attach"]:
+                        pdf = create_sector_overview_pdf(lead, item["vertical"])
+                        att = [ZOHO.upload_file(f"SY_Communications_overview_{draft_filename_part(lead.company_name)}.pdf", pdf)]
+                    ZOHO.send_mail(lead.crm_id, sender, to, "" if contact in ("Team", "there") else contact,
+                                   item["subject"], _email_body_html(item["body"], item["subject"]), att)
+                except ZohoError as exc:
+                    problems.append(f"{name}: not sent. {exc}")
+                    continue
+            # Fill blanks + status + note. The email has gone by now, so a failure here is a warning, not a stop.
+            found = zoho_updates(lead, item)
+            fields = {ZOHO_FIELD_API[k]: v for k, v in found.items() if k in ZOHO_FIELD_API}
+            if new_status and not prepare_only:
+                fields["Lead_Status"] = new_status
+            if prepare_only:
+                note = (f"Pitch prepared by {who} on {stamp} (not sent yet).\nTo: {to or 'no address'}\n"
+                        f"Subject: {item['subject']}\n\n{item['body']}")
+                title = "Lead Revival: pitch ready to send"
+            else:
+                note = (f"Emailed by {who} via Lead Revival on {stamp}.\nTo: {to}\nSubject: {item['subject']}\n"
+                        f"Pitch: {item['vertical']}" + (" (overview PDF attached)" if st.session_state["opt_attach"] else ""))
+                title = "Lead Revival: pitch emailed"
+            if found:
+                note += "\nFilled in: " + ", ".join(f"{k} ({v})" for k, v in found.items())
+            others = [e for e in lead.emails_found if e != to and e != (lead.crm_original or {}).get("Email")]
+            if others:
+                note += "\nOther addresses found: " + ", ".join(others[:4])
             try:
-                att = []
-                if st.session_state["opt_attach"]:
-                    pdf = create_sector_overview_pdf(lead, item["vertical"])
-                    att = [ZOHO.upload_file(f"SY_Communications_overview_{draft_filename_part(lead.company_name)}.pdf", pdf)]
-                ZOHO.send_mail(lead.crm_id, sender, to, "" if contact in ("Team", "there") else contact,
-                               item["subject"], _email_body_html(item["body"], item["subject"]), att)
+                ZOHO.update_lead(lead.crm_id, fields)
+                lead.crm_original = dict(lead.crm_original or {}, **{k: v for k, v in fields.items()})
+                if "Lead_Status" in fields:
+                    lead.crm_status = fields["Lead_Status"]
             except ZohoError as exc:
-                problems.append(f"{name}: not sent. {exc}")
-                continue
-        # Fill blanks + status + note. The email has gone by now, so a failure here is a warning, not a stop.
-        found = zoho_updates(lead, item)
-        fields = {ZOHO_FIELD_API[k]: v for k, v in found.items() if k in ZOHO_FIELD_API}
-        if new_status and not prepare_only:
-            fields["Lead_Status"] = new_status
-        if prepare_only:
-            note = (f"Pitch prepared by {who} on {stamp} (not sent yet).\nTo: {to or 'no address'}\n"
-                    f"Subject: {item['subject']}\n\n{item['body']}")
-            title = "Lead Revival: pitch ready to send"
-        else:
-            note = (f"Emailed by {who} via Lead Revival on {stamp}.\nTo: {to}\nSubject: {item['subject']}\n"
-                    f"Pitch: {item['vertical']}" + (" (overview PDF attached)" if st.session_state["opt_attach"] else ""))
-            title = "Lead Revival: pitch emailed"
-        if found:
-            note += "\nFilled in: " + ", ".join(f"{k} ({v})" for k, v in found.items())
-        others = [e for e in lead.emails_found if e != to and e != (lead.crm_original or {}).get("Email")]
-        if others:
-            note += "\nOther addresses found: " + ", ".join(others[:4])
-        try:
-            ZOHO.update_lead(lead.crm_id, fields)
-            lead.crm_original = dict(lead.crm_original or {}, **{k: v for k, v in fields.items()})
-            if "Lead_Status" in fields:
-                lead.crm_status = fields["Lead_Status"]
-        except ZohoError as exc:
-            problems.append(f"{name}: {'sent, but ' if not prepare_only else ''}fields not updated. {exc}")
-        try:
-            ZOHO.add_note(lead.crm_id, title, note)
-        except ZohoError as exc:
-            problems.append(f"{name}: note not added. {exc}")
-        if not prepare_only:
-            sent_changes[cn] = dict(sent_record(item), via="zoho", status="Emailed via Zoho",
-                                    from_address=sender.get("email") if sender else "")
-        done.append(name)
+                problems.append(f"{name}: {'sent, but ' if not prepare_only else ''}fields not updated. {exc}")
+            try:
+                ZOHO.add_note(lead.crm_id, title, note)
+            except ZohoError as exc:
+                problems.append(f"{name}: note not added. {exc}")
+            if not prepare_only:
+                sent_changes[cn] = dict(sent_record(item), via="zoho", status="Emailed via Zoho",
+                                        from_address=sender.get("email") if sender else "")
+                if len(sent_changes) >= 5:  # Save as we go, so nothing is lost if the page is interrupted
+                    record_sent(dict(sent_changes))
+                    sent_changes.clear()
+            done.append(name)
+    finally:
+        # Save whatever was sent even if the run is cut short (e.g. switching page mid-send)
+        if sent_changes:
+            try:
+                record_sent(dict(sent_changes))
+            except BaseException:  # Page stopping: save without touching the page, then let it stop
+                save_log_quietly(SENT_LOG, dict(sent_changes), "Lead Revival: sends saved after the page was interrupted")
+                raise
+            sent_changes.clear()
     progress.empty()
     if sent_changes:
         record_sent(sent_changes)
@@ -5377,9 +5407,14 @@ with col_left:
             statuses = ZOHO.lead_statuses(st.session_state["zoho_fields"]) or ["Not Contacted"]
             remembered = [x for x in _qp_list("status") if x in statuses]
             default_status = remembered or [s for s in statuses if s.lower() == "not contacted"] or statuses[:1]
+            # Keyed widget, set up once: clearing it and picking one status keeps just that status
+            if "f_status" not in st.session_state:
+                st.session_state["f_status"] = default_status
+            else:
+                st.session_state["f_status"] = [x for x in st.session_state["f_status"] if x in statuses]
             s_col1, s_col2 = columns([2.2, 1])
             with s_col1:
-                chosen_statuses = st.multiselect("Lead Status", statuses, default=default_status,
+                chosen_statuses = st.multiselect("Lead Status", statuses, key="f_status",
                                                  help="Which Zoho leads to pull. Start with Not Contacted.")
             with s_col2:
                 load_btn = st.button("Load leads", type="primary", disabled=not chosen_statuses, **FULL_WIDTH)
@@ -6118,7 +6153,7 @@ def render_zoho_send_panel(ready_sel: List[str], log_now: Dict[str, Any]) -> Non
                 st.markdown(f"Update **{len(ids)} leads** in Zoho and add each pitch as a note? Nothing is emailed.")
             else:
                 st.markdown(f"Send **{len(ids)} emails** now from **{esc(sender['email']) if sender else '?'}**?")
-                st.caption("This can't be undone. Each email is logged on its Zoho lead"
+                st.caption("Keep this page open until it finishes. This can't be undone. Each email is logged on its Zoho lead"
                            + (f", and the Lead Status becomes {status}." if status else "."))
             if st.button("Yes, prepare them" if prepare_only else "Yes, send them now", type="primary",
                          key="zs_confirm", **FULL_WIDTH):
