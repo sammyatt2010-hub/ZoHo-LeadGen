@@ -3590,6 +3590,33 @@ class ZohoCRM:
         except ZohoError:
             return None
 
+    def lead_tags(self, ids: List[str]) -> Dict[str, List[str]]:
+        """{lead id: [tag names]}, read 100 leads per call, several calls at once."""
+        chunks = [ids[i:i + 100] for i in range(0, len(ids), 100)]
+        token = self._token()  # Sign in once up front (the threads below can't touch the page)
+
+        def _one(chunk: List[str]) -> Dict[str, List[str]]:
+            try:
+                resp = requests.request("GET", f"{self.api_domain}/crm/v8/Leads",
+                                        headers={"Authorization": f"Zoho-oauthtoken {token}"},
+                                    params={"ids": ",".join(chunk), "fields": "Tag"}, timeout=25)
+            except requests.exceptions.RequestException as exc:
+                raise ZohoError(f"Couldn't reach Zoho CRM ({exc.__class__.__name__}).")
+            if resp.status_code == 204:
+                return {}
+            if resp.status_code >= 400:
+                raise ZohoError(f"Zoho CRM error reading tags (HTTP {resp.status_code}).")
+            out: Dict[str, List[str]] = {}
+            for r in (resp.json() or {}).get("data") or []:
+                out[str(r.get("id"))] = [str(t.get("name") if isinstance(t, dict) else t) for t in (r.get("Tag") or [])]
+            return out
+
+        result: Dict[str, List[str]] = {}
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for part in pool.map(_one, chunks):
+                result.update(part)
+        return result
+
     @staticmethod
     def picklist_values(fields: Dict[str, Dict[str, Any]], api_name: str) -> List[str]:
         """Options as people see them in Zoho (display value), e.g. every Lead Source."""
@@ -5283,6 +5310,23 @@ def render_zoho_setup() -> None:
             " and isn't saved anywhere else, so don't share it in emails or chats."
         )
 
+# Leads with any tag containing these words are never loaded, in every app (e.g. "Not Interested", "NOT INTERESTED 2025")
+BLOCKED_TAG_WORDS = ("not interested",)
+
+
+def drop_blocked_tags(recs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int, Optional[str]]:
+    """Removes leads tagged Not Interested. Returns (kept, number removed, error)."""
+    ids = [str(r.get("id")) for r in recs if r.get("id")]
+    if not ids:
+        return recs, 0, None
+    try:
+        tags = ZOHO.lead_tags(ids)
+    except ZohoError as exc:
+        return recs, 0, str(exc)
+    blocked = {rid for rid, names in tags.items() if any(w in n.lower() for n in names for w in BLOCKED_TAG_WORDS)}
+    return [r for r in recs if str(r.get("id")) not in blocked], len(blocked), None
+
+
 # ---- Areas: UK postcode areas, grouped into regions ----
 POSTCODE_AREAS = {
     "AB": "Aberdeen", "AL": "St Albans", "B": "Birmingham", "BA": "Bath", "BB": "Blackburn", "BD": "Bradford",
@@ -5468,6 +5512,11 @@ with col_left:
                         load_error = None
                     except ZohoError as exc:
                         recs, load_error = [], str(exc)
+                if not load_error:
+                    with st.spinner("Leaving out leads tagged Not Interested…"):
+                        recs, n_blocked, tag_err = drop_blocked_tags(recs)
+                    st.session_state["n_not_interested"] = n_blocked
+                    st.session_state["tag_check_error"] = tag_err
                 if load_error:
                     st.error(load_error)
                 else:
@@ -5499,7 +5548,12 @@ with col_left:
                     f'<div class="pe-stat"><div class="v">{n_known:,}</div><div class="l">Sector known</div></div>'
                     "</div>"
                 )
-                st.caption(("🚫 " + f"{n_opt} opted out of email · " if n_opt else "") + today_summary())
+                _n_ni = st.session_state.get("n_not_interested") or 0
+                st.caption(("🚫 " + f"{n_opt} opted out of email · " if n_opt else "")
+                           + (f"⛔ {_n_ni:,} tagged Not Interested left out · " if _n_ni else "") + today_summary())
+                if st.session_state.get("tag_check_error"):
+                    st.error("⚠️ Couldn't check Zoho tags, so leads tagged Not Interested may be included. Load the"
+                             " leads again before sending. (" + str(st.session_state["tag_check_error"]) + ")")
 
     recs_all = st.session_state.get("crm_leads") or []
     if recs_all:
