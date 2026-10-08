@@ -5355,33 +5355,20 @@ def remember_lead_tags(seen: Set[str]) -> None:
         save_tag_setting("known_tags", sorted(stored | seen, key=str.lower))
 
 
-def _all_lead_ids(limit: int = 10000) -> List[str]:
-    """Ids of every lead in Zoho (newest first, up to `limit`), via COQL."""
-    out: List[str] = []
-    offset = 0
-    while offset < limit:
-        body = ZOHO._request("POST", "/crm/v8/coql", json={"select_query":
-                             f"select Last_Name from Leads where id is not null order by Created_Time desc "
-                             f"limit {offset}, 2000"})
-        if not body:
-            break
-        out += [str(r.get("id")) for r in body.get("data") or [] if r.get("id")]
-        if not (body.get("info") or {}).get("more_records"):
-            break
-        offset += 2000
-    return out
-
-
-def _tags_on_every_lead(limit: int = 60000) -> Set[str]:
-    """Every tag name used on any lead, read 200 leads at a time with the Get Records API (no row limit)."""
+def _tags_on_every_lead(limit: int = 60000) -> Tuple[Set[str], int, int]:
+    """Every tag name used on any lead, read 200 leads at a time with the Get Records API.
+    Returns (tag names, leads read, leads carrying at least one tag)."""
     seen: Set[str] = set()
     params: Dict[str, Any] = {"fields": "Last_Name,Tag", "per_page": 200, "page": 1}
-    read = 0
+    read = tagged = 0
     while read < limit:
         body = ZOHO._request("GET", "/crm/v8/Leads", params=params) or {}
         rows = body.get("data") or []
         for r in rows:
-            seen.update(str(t.get("name") if isinstance(t, dict) else t) for t in (r.get("Tag") or []) if t)
+            names = [str(t.get("name") if isinstance(t, dict) else t) for t in (r.get("Tag") or []) if t]
+            names = [n for n in names if n and n != "None"]
+            tagged += bool(names)
+            seen.update(names)
         read += len(rows)
         info = body.get("info") or {}
         if not rows or not info.get("more_records"):
@@ -5390,24 +5377,37 @@ def _tags_on_every_lead(limit: int = 60000) -> Set[str]:
             params = {"fields": "Last_Name,Tag", "per_page": 200, "page_token": info["next_page_token"]}
         else:
             params["page"] = params.get("page", 1) + 1
-    return seen
+    return seen, read, tagged
 
 
-def fetch_lead_tag_list() -> Tuple[int, Optional[str]]:
-    """Fills the tag dropdown. Zoho's own tag list if the key allows it; otherwise reads the tags on the leads
-    themselves (the ones loaded, or every lead if none are loaded yet). Returns (tags available, error)."""
+def fetch_lead_tag_list() -> str:
+    """Fills the tag dropdown and returns a plain-English report of what Zoho sent back.
+    1) Zoho's own tag list for Leads (needs the tags permission). 2) If that fails or comes back empty,
+    reads the tags off every lead instead. Both are combined, so nothing is missed."""
     seen: Set[str] = set()
-    err = None
+    notes: List[str] = []
     try:
         body = ZOHO._request("GET", "/crm/v8/settings/tags", params={"module": "Leads"}) or {}
-        seen.update(str(t.get("name")) for t in body.get("tags") or [] if t.get("name"))
-    except ZohoError:
-        try:  # Key without the tags permission: read the tags off EVERY lead instead (slower, needs nothing new)
-            seen.update(_tags_on_every_lead())
+        listed = {str(t.get("name")) for t in body.get("tags") or [] if isinstance(t, dict) and t.get("name")}
+        seen |= listed
+        notes.append(f"Zoho's tag list for Leads has {len(listed)} tag{'s' if len(listed) != 1 else ''}.")
+    except ZohoError as exc:
+        listed = set()
+        notes.append("Zoho's tag list wasn't available (" + str(exc).replace("Zoho CRM error: ", "") + ").")
+    if not listed:
+        try:
+            found, read, tagged = _tags_on_every_lead()
+            seen |= found
+            notes.append(f"Checked {read:,} leads: {tagged:,} carry a tag, using {len(found)} different "
+                         f"tag{'s' if len(found) != 1 else ''}.")
         except ZohoError as exc:
-            err = str(exc)
+            notes.append("Couldn't read the leads either: " + str(exc).replace("Zoho CRM error: ", "") + ".")
     remember_lead_tags(seen)
-    return len([t for t in known_lead_tags() if not any(w in t.lower() for w in BLOCKED_TAG_WORDS)]), err
+    if seen:
+        shown = sorted(seen, key=str.lower)
+        notes.append("Tags found: " + ", ".join(
+            t + (" (always left out)" if any(w in t.lower() for w in BLOCKED_TAG_WORDS) else "") for t in shown) + ".")
+    return " ".join(notes)
 
 
 def drop_blocked_tags(recs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int, Optional[str]]:
@@ -5453,14 +5453,12 @@ def render_excluded_tags_box() -> None:
         if st.button("🔄  Get tags from Zoho" if not all_tags else "🔄  Refresh the tag list", key="lead_tags_fetch",
                      disabled=not ZOHO.configured):
             with st.spinner("Reading tags from Zoho (this can take up to a minute the first time)…"):
-                n_tags, tag_err = fetch_lead_tag_list()
+                tag_report = fetch_lead_tag_list()
             st.session_state["lead_excl_ver"] = st.session_state.get("lead_excl_ver", 0) + 1
-            st.session_state["lead_excl_msg"] = (f"{n_tags} tags available." if n_tags else
-                                                 ("Couldn't read tags from Zoho. " + str(tag_err)) if tag_err else
-                                                 "Zoho didn't return any tags on your leads.")
+            st.session_state["lead_excl_msg"] = tag_report
             st.rerun()
         if st.session_state.get("lead_excl_msg"):
-            st.caption(st.session_state.pop("lead_excl_msg"))
+            st.info(st.session_state.pop("lead_excl_msg"))
         if now:
             st.caption("Now excluding: Not Interested, " + ", ".join(now) + ".")
 
