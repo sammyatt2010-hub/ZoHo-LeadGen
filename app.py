@@ -5314,8 +5314,71 @@ def render_zoho_setup() -> None:
 BLOCKED_TAG_WORDS = ("not interested",)
 
 
+# ---- Tags: "Not Interested" is always left out; other tags can be excluded from the dropdown (saved for everyone) ----
+TAG_SETTINGS = SentLog("GITHUB_CRM_SETTINGS_PATH", "crm_settings.json", ".crm_settings.json")
+
+
+def get_tag_settings() -> Dict[str, Any]:
+    if "tag_settings_data" not in st.session_state:
+        st.session_state["tag_settings_data"] = TAG_SETTINGS.load()
+    return st.session_state["tag_settings_data"]
+
+
+def save_tag_setting(key: str, value: Any) -> Optional[str]:
+    try:
+        st.session_state["tag_settings_data"] = TAG_SETTINGS.apply({key: value}, f"Lead Revival: {key} updated")
+        return None
+    except Exception as exc:
+        st.session_state.setdefault("tag_settings_data", {})[key] = value
+        return str(exc)
+
+
+def known_lead_tags() -> List[str]:
+    names = set(get_tag_settings().get("known_tags") or []) | set(st.session_state.get("seen_tags") or [])
+    return sorted(names, key=str.lower)
+
+
+def excluded_lead_tags() -> List[str]:
+    picked = get_tag_settings().get("exclude_tag_names")
+    return list(picked) if isinstance(picked, list) else []
+
+
+def lead_tag_blocked(name: str, picked: Set[str]) -> bool:
+    low = name.strip().lower()
+    return any(w in low for w in BLOCKED_TAG_WORDS) or low in picked
+
+
+def remember_lead_tags(seen: Set[str]) -> None:
+    st.session_state["seen_tags"] = sorted(set(st.session_state.get("seen_tags") or []) | seen)
+    stored = set(get_tag_settings().get("known_tags") or [])
+    if seen and not seen <= stored:
+        save_tag_setting("known_tags", sorted(stored | seen, key=str.lower))
+
+
+def fetch_lead_tag_list() -> Tuple[int, Optional[str]]:
+    """Fills the tag dropdown: Zoho's own tag list if the key allows it, otherwise the tags on the leads loaded."""
+    seen: Set[str] = set()
+    err = None
+    try:
+        body = ZOHO._request("GET", "/crm/v8/settings/tags", params={"module": "Leads"}) or {}
+        seen.update(str(t.get("name")) for t in body.get("tags") or [] if t.get("name"))
+    except ZohoError as exc:
+        err = str(exc)
+        ids = [str(r.get("id")) for r in (st.session_state.get("crm_leads") or []) if r.get("id")]
+        if ids:
+            try:
+                for names in ZOHO.lead_tags(ids).values():
+                    seen.update(names)
+                err = None
+            except ZohoError as exc2:
+                err = str(exc2)
+    remember_lead_tags(seen)
+    return len(known_lead_tags()), err
+
+
 def drop_blocked_tags(recs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int, Optional[str]]:
-    """Removes leads tagged Not Interested. Returns (kept, number removed, error)."""
+    """Removes leads tagged Not Interested, or with any tag picked under Excluded tags.
+    Returns (kept, number removed, error). Also remembers every tag seen, for the dropdown."""
     ids = [str(r.get("id")) for r in recs if r.get("id")]
     if not ids:
         return recs, 0, None
@@ -5323,8 +5386,49 @@ def drop_blocked_tags(recs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
         tags = ZOHO.lead_tags(ids)
     except ZohoError as exc:
         return recs, 0, str(exc)
-    blocked = {rid for rid, names in tags.items() if any(w in n.lower() for n in names for w in BLOCKED_TAG_WORDS)}
+    remember_lead_tags({n for names in tags.values() for n in names})
+    picked = {t.strip().lower() for t in excluded_lead_tags()}
+    blocked = {rid: [n for n in names if lead_tag_blocked(n, picked)] for rid, names in tags.items()}
+    blocked = {rid: hits for rid, hits in blocked.items() if hits}
+    st.session_state["blocked_tag_names"] = sorted({h for hits in blocked.values() for h in hits}, key=str.lower)
     return [r for r in recs if str(r.get("id")) not in blocked], len(blocked), None
+
+
+def render_excluded_tags_box() -> None:
+    """The 🚫 Excluded tags dropdown (fixed label so it stays open while used)."""
+    with st.expander("🚫  Excluded tags", expanded=False):
+        all_tags = known_lead_tags()
+        now = excluded_lead_tags()
+        st.caption("Leads carrying any of these Zoho tags are never loaded. Anything tagged Not Interested is always"
+                   " left out as well. Saved for everyone."
+                   + ("" if all_tags else " Click the button below (or load leads once) to fill the list."))
+        opts = sorted({t for t in set(all_tags) | set(now)  # Not Interested is always excluded, so not offered
+                       if not any(w in t.lower() for w in BLOCKED_TAG_WORDS)}, key=str.lower)
+        t1, t2 = columns([2.2, 1])
+        with t1:
+            new = st.multiselect("Leave out anything tagged", opts, default=now, placeholder="Pick tags to exclude",
+                                 key=f"lead_excl_{st.session_state.get('lead_excl_ver', 0)}_{abs(hash(tuple(opts + now))) % 10**6}")
+        with t2:
+            changed = sorted(t.lower() for t in new) != sorted(t.lower() for t in now)
+            if st.button("Save", key="lead_excl_save", disabled=not changed, **FULL_WIDTH):
+                err = save_tag_setting("exclude_tag_names", list(new))
+                st.session_state["lead_excl_ver"] = st.session_state.get("lead_excl_ver", 0) + 1
+                st.session_state["lead_excl_msg"] = (f"Saved for this session only: {err}" if err else
+                                                     "Saved. Click Load leads again to apply it.")
+                st.rerun()
+        if st.button("🔄  Get tags from Zoho" if not all_tags else "🔄  Refresh the tag list", key="lead_tags_fetch",
+                     disabled=not ZOHO.configured):
+            with st.spinner("Reading tags from Zoho…"):
+                n_tags, tag_err = fetch_lead_tag_list()
+            st.session_state["lead_excl_ver"] = st.session_state.get("lead_excl_ver", 0) + 1
+            st.session_state["lead_excl_msg"] = (f"{n_tags} tags available." if n_tags else
+                                                 "No tags found yet. Load some leads, then try again."
+                                                 + (f" ({tag_err})" if tag_err else ""))
+            st.rerun()
+        if st.session_state.get("lead_excl_msg"):
+            st.caption(st.session_state.pop("lead_excl_msg"))
+        if now:
+            st.caption("Now excluding: Not Interested, " + ", ".join(now) + ".")
 
 
 # ---- Areas: UK postcode areas, grouped into regions ----
@@ -5513,7 +5617,7 @@ with col_left:
                     except ZohoError as exc:
                         recs, load_error = [], str(exc)
                 if not load_error:
-                    with st.spinner("Leaving out leads tagged Not Interested…"):
+                    with st.spinner("Checking tags (Not Interested and any excluded tags)…"):
                         recs, n_blocked, tag_err = drop_blocked_tags(recs)
                     st.session_state["n_not_interested"] = n_blocked
                     st.session_state["tag_check_error"] = tag_err
@@ -5550,10 +5654,12 @@ with col_left:
                 )
                 _n_ni = st.session_state.get("n_not_interested") or 0
                 st.caption(("🚫 " + f"{n_opt} opted out of email · " if n_opt else "")
-                           + (f"⛔ {_n_ni:,} tagged Not Interested left out · " if _n_ni else "") + today_summary())
+                           + (f"⛔ {_n_ni:,} left out by tag ("
+                              + ", ".join(st.session_state.get("blocked_tag_names") or ["Not Interested"]) + ") · " if _n_ni else "") + today_summary())
                 if st.session_state.get("tag_check_error"):
                     st.error("⚠️ Couldn't check Zoho tags, so leads tagged Not Interested may be included. Load the"
                              " leads again before sending. (" + str(st.session_state["tag_check_error"]) + ")")
+            render_excluded_tags_box()
 
     recs_all = st.session_state.get("crm_leads") or []
     if recs_all:
