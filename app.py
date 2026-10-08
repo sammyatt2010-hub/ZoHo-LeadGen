@@ -3469,6 +3469,9 @@ ZOHO_FIELD_API = {"Website": "Website", "Phone": "Phone", "Email": "Email",
                   "First Name": "First_Name", "Last Name": "Last_Name", "Title": "Designation"}
 
 
+NO_VALUE = "(blank)"
+
+
 class ZohoError(RuntimeError):
     pass
 
@@ -3587,14 +3590,41 @@ class ZohoCRM:
         except ZohoError:
             return None
 
-    def leads(self, statuses: List[str], available: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """All leads in the given statuses (up to ZOHO_MAX_LEADS), via COQL in pages of 200."""
+    @staticmethod
+    def picklist_values(fields: Dict[str, Dict[str, Any]], api_name: str) -> List[str]:
+        """Options as people see them in Zoho (display value), e.g. every Lead Source."""
+        values = (fields.get(api_name) or {}).get("pick_list_values") or []
+        out = [v.get("display_value") or v.get("actual_value") for v in values]
+        return [v for v in dict.fromkeys(out) if v and v != "-None-"]
+
+    @staticmethod
+    def picklist_spellings(fields: Dict[str, Dict[str, Any]], api_name: str, chosen: List[str]) -> List[str]:
+        """Every way Zoho may store the chosen options (display and actual value differ if an option was renamed)."""
+        out = list(chosen)
+        for v in (fields.get(api_name) or {}).get("pick_list_values") or []:
+            if (v.get("display_value") in chosen or v.get("actual_value") in chosen):
+                out += [x for x in (v.get("display_value"), v.get("actual_value")) if x]
+        return list(dict.fromkeys(out))
+
+    def leads(self, statuses: List[str], available: Dict[str, Any],
+              sources: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """All leads in the given statuses (and Lead Sources, if any picked), up to ZOHO_MAX_LEADS, via COQL.
+        NO_VALUE in either list also includes leads where that field is blank."""
         fields = [f for f in ZOHO_LEAD_FIELDS if not available or f in available]
-        quoted = ", ".join("'" + s.replace("'", "\\'") + "'" for s in statuses)
+
+        def _cond(field: str, picked: List[str]) -> str:
+            real = [x for x in picked if x != NO_VALUE]
+            quoted = ", ".join("'" + x.replace("'", "\\'") + "'" for x in self.picklist_spellings(available, field, real))
+            parts = ([f"{field} in ({quoted})"] if real else []) + ([f"{field} is null"] if NO_VALUE in picked else [])
+            return parts[0] if len(parts) == 1 else f"({parts[0]} or {parts[1]})"
+
+        where = _cond("Lead_Status", statuses)
+        if sources:
+            where = f"({where} and {_cond('Lead_Source', sources)})"
         out: List[Dict[str, Any]] = []
         offset = 0
         while offset < ZOHO_MAX_LEADS:
-            query = (f"select {', '.join(fields)} from Leads where Lead_Status in ({quoted}) "
+            query = (f"select {', '.join(fields)} from Leads where {where} "
                      f"order by Created_Time desc limit {offset}, {ZOHO_PAGE}")
             try:
                 body = self._request("POST", "/crm/v8/coql", json={"select_query": query})
@@ -5404,7 +5434,7 @@ with col_left:
                 crm_ready = True
 
         if crm_ready:
-            statuses = ZOHO.lead_statuses(st.session_state["zoho_fields"]) or ["Not Contacted"]
+            statuses = (ZOHO.lead_statuses(st.session_state["zoho_fields"]) or ["Not Contacted"]) + [NO_VALUE]
             remembered = [x for x in _qp_list("status") if x in statuses]
             default_status = remembered or [s for s in statuses if s.lower() == "not contacted"] or statuses[:1]
             # Keyed widget, set up once: clearing it and picking one status keeps just that status
@@ -5412,17 +5442,29 @@ with col_left:
                 st.session_state["f_status"] = default_status
             else:
                 st.session_state["f_status"] = [x for x in st.session_state["f_status"] if x in statuses]
-            s_col1, s_col2 = columns([2.2, 1])
+            # Every Lead Source set up in Zoho (read from the field itself, not just the leads loaded so far)
+            all_sources = ZOHO.picklist_values(st.session_state["zoho_fields"], "Lead_Source") + [NO_VALUE]
+            if "f_load_sources" not in st.session_state:
+                st.session_state["f_load_sources"] = [x for x in _qp_list("lsrc") if x in all_sources]
+            else:
+                st.session_state["f_load_sources"] = [x for x in st.session_state["f_load_sources"] if x in all_sources]
+            s_col1, s_col2 = st.columns(2)
             with s_col1:
                 chosen_statuses = st.multiselect("Lead Status", statuses, key="f_status",
-                                                 help="Which Zoho leads to pull. Start with Not Contacted.")
+                                                 help="Which Zoho leads to pull. Start with Not Contacted."
+                                                      f" '{NO_VALUE}' means leads with no status set (common after an import).")
             with s_col2:
-                load_btn = st.button("Load leads", type="primary", disabled=not chosen_statuses, **FULL_WIDTH)
+                chosen_sources = st.multiselect("Lead Source", all_sources, key="f_load_sources", placeholder="All sources",
+                                                help="Every Lead Source in your Zoho. Leave empty for all, or pick the"
+                                                     f" batches you want to work, e.g. Ginger or Silverback. '{NO_VALUE}'"
+                                                     " means leads with no source set.")
+            load_btn = st.button("Load leads", type="primary", disabled=not chosen_statuses, **FULL_WIDTH)
             _qp_save("status", chosen_statuses)
+            _qp_save("lsrc", chosen_sources)
             if load_btn:
                 with st.spinner("Pulling leads from Zoho CRM…"):
                     try:
-                        recs = ZOHO.leads(chosen_statuses, st.session_state["zoho_fields"])
+                        recs = ZOHO.leads(chosen_statuses, st.session_state["zoho_fields"], chosen_sources)
                         load_error = None
                     except ZohoError as exc:
                         recs, load_error = [], str(exc)
@@ -5434,13 +5476,14 @@ with col_left:
                         r["_area"] = area_of(r)
                         r["_sector"] = guess_sector(r.get("Company") or "", r.get("Industry") or "", r.get("Description") or "")
                     st.session_state["crm_leads"] = recs
-                    st.session_state["crm_statuses_loaded"] = list(chosen_statuses)
+                    st.session_state["crm_statuses_loaded"] = list(chosen_statuses) + (
+                        [f"source: {', '.join(chosen_sources)}"] if chosen_sources else [])
                     st.session_state["search_version"] = st.session_state.get("search_version", 0) + 1
                     st.session_state["stat_searches"] += 1
                     st.session_state["stat_firms"] = len(recs)
                     st.session_state.pop("research_data", None)  # Pick up colleagues' work
                     if not recs:
-                        st.warning("No leads in Zoho with that status.")
+                        st.warning("No leads in Zoho with that status" + (" and source." if chosen_sources else "."))
                     elif len(recs) >= ZOHO_MAX_LEADS:
                         st.info(f"Showing the newest {ZOHO_MAX_LEADS:,} leads.")
 
