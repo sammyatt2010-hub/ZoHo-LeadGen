@@ -5372,6 +5372,27 @@ def _all_lead_ids(limit: int = 10000) -> List[str]:
     return out
 
 
+def _tags_on_every_lead(limit: int = 60000) -> Set[str]:
+    """Every tag name used on any lead, read 200 leads at a time with the Get Records API (no row limit)."""
+    seen: Set[str] = set()
+    params: Dict[str, Any] = {"fields": "Last_Name,Tag", "per_page": 200, "page": 1}
+    read = 0
+    while read < limit:
+        body = ZOHO._request("GET", "/crm/v8/Leads", params=params) or {}
+        rows = body.get("data") or []
+        for r in rows:
+            seen.update(str(t.get("name") if isinstance(t, dict) else t) for t in (r.get("Tag") or []) if t)
+        read += len(rows)
+        info = body.get("info") or {}
+        if not rows or not info.get("more_records"):
+            break
+        if info.get("next_page_token"):
+            params = {"fields": "Last_Name,Tag", "per_page": 200, "page_token": info["next_page_token"]}
+        else:
+            params["page"] = params.get("page", 1) + 1
+    return seen
+
+
 def fetch_lead_tag_list() -> Tuple[int, Optional[str]]:
     """Fills the tag dropdown. Zoho's own tag list if the key allows it; otherwise reads the tags on the leads
     themselves (the ones loaded, or every lead if none are loaded yet). Returns (tags available, error)."""
@@ -5381,10 +5402,8 @@ def fetch_lead_tag_list() -> Tuple[int, Optional[str]]:
         body = ZOHO._request("GET", "/crm/v8/settings/tags", params={"module": "Leads"}) or {}
         seen.update(str(t.get("name")) for t in body.get("tags") or [] if t.get("name"))
     except ZohoError:
-        try:  # Key without the tags permission: read them off the leads instead (slower, but needs nothing new)
-            ids = [str(r.get("id")) for r in (st.session_state.get("crm_leads") or []) if r.get("id")] or _all_lead_ids()
-            for names in ZOHO.lead_tags(ids).values():
-                seen.update(names)
+        try:  # Key without the tags permission: read the tags off EVERY lead instead (slower, needs nothing new)
+            seen.update(_tags_on_every_lead())
         except ZohoError as exc:
             err = str(exc)
     remember_lead_tags(seen)
