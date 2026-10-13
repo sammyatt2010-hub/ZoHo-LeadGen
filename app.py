@@ -3634,7 +3634,7 @@ class ZohoCRM:
         return list(dict.fromkeys(out))
 
     def leads(self, statuses: List[str], available: Dict[str, Any],
-              sources: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+              sources: Optional[List[str]] = None, email_only: bool = False) -> List[Dict[str, Any]]:
         """All leads in the given statuses (and Lead Sources, if any picked), up to ZOHO_MAX_LEADS, via COQL.
         NO_VALUE in either list also includes leads where that field is blank."""
         fields = [f for f in ZOHO_LEAD_FIELDS if not available or f in available]
@@ -3648,6 +3648,8 @@ class ZohoCRM:
         where = _cond("Lead_Status", statuses)
         if sources:
             where = f"({where} and {_cond('Lead_Source', sources)})"
+        if email_only:  # Same as MY PA: only leads that already have an email address in Zoho
+            where = f"({where} and Email is not null)"
         out: List[Dict[str, Any]] = []
         offset = 0
         while offset < ZOHO_MAX_LEADS:
@@ -4033,6 +4035,38 @@ def get_sent_log() -> Dict[str, Any]:
         st.session_state["sent_log_data"] = SENT_LOG.load()
         st.session_state["sent_log_data_epoch"] = _log_epoch()
     return st.session_state["sent_log_data"]
+
+
+# ---- Leads the other app has emailed (MY PA), so a lead is only emailed by both when you choose to ----
+OTHER_APP, OTHER_ICON, OTHER_TAG = "MY PA", "🟡", "MY PA Trial Offered"
+OTHER_LOG = SentLog("GITHUB_MYPA_LOG_PATH", "mypa_sent_log.json", ".mypa_sent_log.json")
+OTHER_LOG.repo = _secret_value("MYPA_GITHUB_REPO", OTHER_LOG.repo)  # Same data repo as this app unless set
+OTHER_LOG.token = _secret_value("MYPA_GITHUB_TOKEN", OTHER_LOG.token)
+OTHER_LOG.backend = "github" if (OTHER_LOG.token and OTHER_LOG.repo) else "local"
+
+
+def other_app_contacted() -> Dict[str, str]:
+    """{lead id: 'd Mon' (or '' if unknown)} for leads MY PA has emailed: its own log, plus its Zoho tag."""
+    cached = st.session_state.get("other_app_sent")
+    if not cached or time.time() - cached[0] > 300:
+        out: Dict[str, str] = {}
+        for k, r in (OTHER_LOG.load() or {}).items():
+            if not isinstance(r, dict) or str(r.get("status") or "").startswith("Called"):
+                continue
+            if not (r.get("to") or r.get("via") == "zoho"):
+                continue  # Ticked as handled without an email
+            try:
+                out[str(k)] = datetime.fromisoformat(str(r.get("sent_at"))).strftime("%d %b").lstrip("0")
+            except ValueError:
+                out[str(k)] = ""
+        cached = (time.time(), out, OTHER_LOG.last_error)
+        st.session_state["other_app_sent"] = cached
+    out = dict(cached[1])
+    if OTHER_TAG:
+        for rid, names in (st.session_state.get("lead_tag_map") or {}).items():
+            if any(str(n).strip().lower() == OTHER_TAG.lower() for n in names):
+                out.setdefault(str(rid), "")
+    return out
 
 
 def bump_queue_editor() -> None:
@@ -5420,6 +5454,7 @@ def drop_blocked_tags(recs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
         tags = ZOHO.lead_tags(ids)
     except ZohoError as exc:
         return recs, 0, str(exc)
+    st.session_state["lead_tag_map"] = tags
     remember_lead_tags({n for names in tags.values() for n in names})
     picked = {t.strip().lower() for t in excluded_lead_tags()}
     blocked = {rid: [n for n in names if lead_tag_blocked(n, picked)] for rid, names in tags.items()}
@@ -5638,13 +5673,20 @@ with col_left:
                                                 help="Every Lead Source in your Zoho. Leave empty for all, or pick the"
                                                      f" batches you want to work, e.g. Ginger or Silverback. '{NO_VALUE}'"
                                                      " means leads with no source set.")
+            if "f_email_only" not in st.session_state:
+                st.session_state["f_email_only"] = _qp_list("email") != ["all"]
+            email_only = st.toggle("Only leads with an email in Zoho", key="f_email_only",
+                                   help="On: loads just the leads that already have an email address, like the MY PA"
+                                        " engine, so every batch can be emailed. Off: loads every lead, and enrichment"
+                                        " tries to find missing emails on their websites.")
             load_btn = st.button("Load leads", type="primary", disabled=not chosen_statuses, **FULL_WIDTH)
+            _qp_save("email", [] if email_only else ["all"])
             _qp_save("status", chosen_statuses)
             _qp_save("lsrc", chosen_sources)
             if load_btn:
                 with st.spinner("Pulling leads from Zoho CRM…"):
                     try:
-                        recs = ZOHO.leads(chosen_statuses, st.session_state["zoho_fields"], chosen_sources)
+                        recs = ZOHO.leads(chosen_statuses, st.session_state["zoho_fields"], chosen_sources, email_only)
                         load_error = None
                     except ZohoError as exc:
                         recs, load_error = [], str(exc)
@@ -5662,13 +5704,16 @@ with col_left:
                         r["_sector"] = guess_sector(r.get("Company") or "", r.get("Industry") or "", r.get("Description") or "")
                     st.session_state["crm_leads"] = recs
                     st.session_state["crm_statuses_loaded"] = list(chosen_statuses) + (
-                        [f"source: {', '.join(chosen_sources)}"] if chosen_sources else [])
+                        [f"source: {', '.join(chosen_sources)}"] if chosen_sources else []) + (
+                        ["with an email"] if email_only else [])
                     st.session_state["search_version"] = st.session_state.get("search_version", 0) + 1
                     st.session_state["stat_searches"] += 1
                     st.session_state["stat_firms"] = len(recs)
                     st.session_state.pop("research_data", None)  # Pick up colleagues' work
                     if not recs:
-                        st.warning("No leads in Zoho with that status" + (" and source." if chosen_sources else "."))
+                        st.warning("No leads in Zoho with that status" + (" and source" if chosen_sources else "")
+                                   + (" that have an email. Turn off 'Only leads with an email in Zoho' to load"
+                                      " the rest." if email_only else "."))
                     elif len(recs) >= ZOHO_MAX_LEADS:
                         st.info(f"Showing the newest {ZOHO_MAX_LEADS:,} leads.")
 
@@ -5756,6 +5801,14 @@ with col_left:
             with f3:
                 order = st.selectbox("Order", ["Newest first", "Oldest first"],
                                      help="Which end of the list today's batch comes from.")
+            g3, _g4 = st.columns(2)
+            with g3:
+                other_mode = st.selectbox(
+                    f"Already emailed by {OTHER_APP}", ["Leave out", "Include", "Only these"], key="f_other_app",
+                    help=f"Leads already emailed by the {OTHER_APP} app (from its log and Zoho). Leave out stops a lead"
+                         f" getting both emails. Pick Only these to come back to them later; {OTHER_APP} sets them to"
+                         " Attempted to Contact, so add that status above and load again.")
+            other_sent = other_app_contacted()
             g1, g2 = st.columns(2)
             with g1:
                 hide_done = st.toggle("Hide already-worked leads", value=True,
@@ -5779,6 +5832,7 @@ with col_left:
                 and (not src or (r.get("Lead_Source") or "—") in src)
                 and (not gaps_only or lead_gaps(r))
                 and (not hide_done or not _done(r))
+                and (other_mode == "Include" or ((r["id"] in other_sent) == (other_mode == "Only these")))
             ]
             recs.sort(key=lambda r: r.get("Created_Time") or "", reverse=(order == "Newest first"))
 
@@ -5793,8 +5847,18 @@ with col_left:
                         return "🔎 " + datetime.fromisoformat(rr["at"]).strftime("%d %b").lstrip("0")
                     except ValueError:
                         return "🔎 Researched"
+                if r["id"] in other_sent:
+                    return f"{OTHER_ICON} {OTHER_APP} " + (other_sent[r["id"]] or "emailed")
                 return "🚫 Opted out" if r.get("Email_Opt_Out") else ""
 
+            n_other_hidden = sum(1 for r in recs_all if r["id"] in other_sent) if other_mode == "Leave out" else 0
+            if n_other_hidden:
+                st.caption(f"{OTHER_ICON} {n_other_hidden:,} loaded {'lead has' if n_other_hidden == 1 else 'leads have'}"
+                           f" already been emailed by {OTHER_APP}, so {'it is' if n_other_hidden == 1 else 'they are'}"
+                           f" left out. Change 'Already emailed by {OTHER_APP}' to see them.")
+            if not recs and other_mode == "Only these":
+                st.caption(f"{OTHER_APP} moves the leads it emails to Attempted to Contact. Add that status at the top"
+                           " and click Load leads to see them here.")
             if not recs:
                 st.caption("No leads match these filters." + (" Everything here has already been worked. Turn off"
                            " 'Hide already-worked leads' to see them." if hide_done else ""))
