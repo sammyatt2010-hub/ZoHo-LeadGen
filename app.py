@@ -420,6 +420,14 @@ def initials(name: str) -> str:
 # ==========================================
 
 
+def cleanse_logins() -> List[Tuple[str, str]]:
+    """Data-cleanse logins from Secrets: [CLEANSE_USERS] name = "password". They get a simplified Lead Revival."""
+    try:
+        return [(str(k), str(v)) for k, v in dict(st.secrets.get("CLEANSE_USERS") or {}).items() if v]
+    except Exception:
+        return []
+
+
 def check_password() -> bool:
     # Fail CLOSED: if the secret is missing or misconfigured, nobody gets in.
     try:
@@ -438,11 +446,18 @@ def check_password() -> bool:
         return False
 
     def password_entered():
-        if hmac.compare_digest(
-            st.session_state.get("password", "").encode("utf-8"),
-            str(configured_password).encode("utf-8"),
-        ):
+        typed = st.session_state.get("password", "").encode("utf-8")
+        role, who = None, ""
+        if hmac.compare_digest(typed, str(configured_password).encode("utf-8")):
+            role = "full"
+        else:
+            for name, pw in cleanse_logins():
+                if hmac.compare_digest(typed, pw.encode("utf-8")):
+                    role, who = "cleanse", name
+                    break
+        if role:
             st.session_state["password_correct"] = True
+            st.session_state["role"], st.session_state["cleanse_user"] = role, who
             del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
@@ -3634,7 +3649,8 @@ class ZohoCRM:
         return list(dict.fromkeys(out))
 
     def leads(self, statuses: List[str], available: Dict[str, Any],
-              sources: Optional[List[str]] = None, email_only: bool = False) -> List[Dict[str, Any]]:
+              sources: Optional[List[str]] = None, email_only: bool = False,
+              order_by: str = "Created_Time") -> List[Dict[str, Any]]:
         """All leads in the given statuses (and Lead Sources, if any picked), up to ZOHO_MAX_LEADS, via COQL.
         NO_VALUE in either list also includes leads where that field is blank."""
         fields = [f for f in ZOHO_LEAD_FIELDS if not available or f in available]
@@ -3654,7 +3670,7 @@ class ZohoCRM:
         offset = 0
         while offset < ZOHO_MAX_LEADS:
             query = (f"select {', '.join(fields)} from Leads where {where} "
-                     f"order by Created_Time desc limit {offset}, {ZOHO_PAGE}")
+                     f"order by {order_by} desc limit {offset}, {ZOHO_PAGE}")
             try:
                 body = self._request("POST", "/crm/v8/coql", json={"select_query": query})
             except ZohoError:
@@ -4438,11 +4454,21 @@ def zoho_senders() -> Tuple[List[Dict[str, Any]], Optional[str]]:
     return st.session_state["zoho_from"], None
 
 
+def cleanse_sender(senders: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The data-cleanse login's fixed From address (CLEANSE_FROM, e.g. vh@sycomms.co.uk) from Zoho's list."""
+    for a in senders:
+        if (a.get("email") or "").strip().lower() == CLEANSE_FROM:
+            return dict(a, user_name=a.get("user_name") or get_sender().get("name") or "")
+    return None
+
+
 def zoho_send_choice() -> Tuple[Optional[Dict[str, Any]], Optional[str], bool]:
     """(from address, status to set after sending, prepare-only) as chosen in the Send via Zoho panel."""
     senders, _ = zoho_senders()
     idx = st.session_state.get("zs_from", 0)
     sender = senders[idx] if senders and isinstance(idx, int) and idx < len(senders) else (senders[0] if senders else None)
+    if CLEANSE_MODE:  # Always the one fixed address, never a choice
+        sender = cleanse_sender(senders)
     status = st.session_state.get("zs_status", ZS_DEFAULT_STATUS)
     statuses = ZOHO.lead_statuses(st.session_state.get("zoho_fields") or {})
     if status == ZS_DEFAULT_STATUS:
@@ -4595,85 +4621,98 @@ def columns(spec, **kwargs):
 
 
 # ---------------- Sidebar ----------------
+CLEANSE_MODE = st.session_state.get("role") == "cleanse"
+CLEANSE_SOURCES = [x.strip() for x in _secret_value("CLEANSE_SOURCES", "Ginger, Silverback").split(",") if x.strip()]
+CLEANSE_FROM = _secret_value("CLEANSE_FROM", "vh@sycomms.co.uk").strip().lower()
+ORDER_UPDATED = "Recently updated first"
+
 with st.sidebar:
     render_html(
         f'<div class="pe-brand"><div class="pe-logo">{icon("target", 22, 2.2)}</div>'
         f'<div><div class="n">{APP_NAME}</div><div class="s">{APP_TAGLINE}</div></div></div>'
     )
     # ---- Workspace switch (bookmarkable: ?view=calls) ----
+    if CLEANSE_MODE:
+        st.session_state["view"] = "prospect"
     if "view" not in st.session_state:
         st.session_state["view"] = st.query_params.get("view") if st.query_params.get("view") in ("calls", "activity") else "prospect"
     _n_to_call = len(call_queue(get_call_list()))
     _views = {"prospect": "🗂  Zoho leads", "calls": "📞  Call list", "activity": "📊  Activity"}
     if st.session_state["view"] not in _views:
         st.session_state["view"] = "prospect"
-    st.session_state["view"] = st.radio(
-        "Workspace", list(_views), key="w_view", label_visibility="collapsed",
-        index=list(_views).index(st.session_state["view"]), format_func=_views.get,
-    )  # Labels stay fixed: a changing label would make Streamlit reset the switch
+    if not CLEANSE_MODE:  # Data-cleanse logins only work Zoho leads
+        st.session_state["view"] = st.radio(
+            "Workspace", list(_views), key="w_view", label_visibility="collapsed",
+            index=list(_views).index(st.session_state["view"]), format_func=_views.get,
+        )  # Labels stay fixed: a changing label would make Streamlit reset the switch
     if _n_to_call:
         render_html(f'<div style="font-size:.76rem;color:var(--muted);margin:-2px 0 6px 4px">'
                     f'{_n_to_call} {"firm" if _n_to_call == 1 else "firms"} waiting on the call list</div>')
     if st.query_params.get("view", "prospect") != st.session_state["view"]:
         st.query_params["view"] = st.session_state["view"]
-    render_html('<div class="pe-side-h">Connections</div>')
-    if secret_ch_key:
-        # Key stays server-side: never placed in a widget, so never sent to the browser.
+    if CLEANSE_MODE:
         ch_api_key = secret_ch_key
+        render_html(f'<div class="pe-status">Zoho CRM<span class="st {"ok" if ZOHO.configured else "off"}">'
+                    f'{"Connected" if ZOHO.configured else "Not connected"}</span></div>')
     else:
-        ch_api_key = st.text_input(
-            "Companies House API key (optional)",
-            type="password",
-            help=(
-                "Optional: finds directors and company numbers for your leads. Paste a key for this"
-                " session, or add COMPANIES_HOUSE_KEY to Streamlit Secrets."
-            ),
+        render_html('<div class="pe-side-h">Connections</div>')
+        if secret_ch_key:
+            # Key stays server-side: never placed in a widget, so never sent to the browser.
+            ch_api_key = secret_ch_key
+        else:
+            ch_api_key = st.text_input(
+                "Companies House API key (optional)",
+                type="password",
+                help=(
+                    "Optional: finds directors and company numbers for your leads. Paste a key for this"
+                    " session, or add COMPANIES_HOUSE_KEY to Streamlit Secrets."
+                ),
+            )
+        ch_state = ('ok">Connected' if secret_ch_key else ('idle">Session key' if ch_api_key else 'idle">Optional'))
+        zoho_state = ('idle">Setup needed' if ZOHO.can_setup else 'off">Not set up' if not ZOHO.configured else 'ok">Connected' if st.session_state.get("zoho_fields")
+                      else 'idle">Ready')
+        render_html(
+            f'<div class="pe-status">Zoho CRM<span class="st {zoho_state}</span></div>'
+            f'<div class="pe-status">Companies House<span class="st {ch_state}</span></div>'
+            '<div class="pe-status">Web discovery<span class="st ok">Ready</span></div>'
+            '<div class="pe-status">PDF dossiers<span class="st ok">Ready</span></div>'
         )
-    ch_state = ('ok">Connected' if secret_ch_key else ('idle">Session key' if ch_api_key else 'idle">Optional'))
-    zoho_state = ('idle">Setup needed' if ZOHO.can_setup else 'off">Not set up' if not ZOHO.configured else 'ok">Connected' if st.session_state.get("zoho_fields")
-                  else 'idle">Ready')
-    render_html(
-        f'<div class="pe-status">Zoho CRM<span class="st {zoho_state}</span></div>'
-        f'<div class="pe-status">Companies House<span class="st {ch_state}</span></div>'
-        '<div class="pe-status">Web discovery<span class="st ok">Ready</span></div>'
-        '<div class="pe-status">PDF dossiers<span class="st ok">Ready</span></div>'
-    )
-    get_sent_log()
-    if SENT_LOG.last_error or st.session_state.get("sent_log_error"):
-        log_state = 'off">Error'
-    elif SENT_LOG.backend == "github":
-        log_state = 'ok">Saved to GitHub'
-    else:
-        log_state = 'idle">Temporary'
-    render_html(f'<div class="pe-status">Sent log<span class="st {log_state}</span></div>')
-    call_state = ('off">Error' if CALL_STORE.last_error else 'ok">Saved to GitHub' if CALL_STORE.backend == "github" else 'idle">Temporary')
-    render_html(f'<div class="pe-status">Call list<span class="st {call_state}</span></div>')
-    places_state = 'ok">Connected' if _secret_value("GOOGLE_PLACES_API_KEY") else 'idle">Not set up'
-    render_html(f'<div class="pe-status">Google Maps lookup<span class="st {places_state}</span></div>')
-    fca_state = 'ok">Connected' if _secret_value("FCA_API_KEY") and _secret_value("FCA_API_EMAIL") else 'idle">Add free key'
-    sra_state = 'ok">Connected' if _secret_value("SRA_API_KEY") else 'idle">Add free key'
-    render_html(
-        '<div class="pe-status">OpenStreetMap<span class="st ok">Free · ready</span></div>'
-        '<div class="pe-status">Email domain checks<span class="st ok">Free · ready</span></div>'
-        '<div class="pe-status">Owners (Companies House)<span class="st ok">Free · ready</span></div>'
-        f'<div class="pe-status">FCA register<span class="st {fca_state}</span></div>'
-        f'<div class="pe-status">SRA register<span class="st {sra_state}</span></div>'
-    )
-    if SENT_LOG.last_error or st.session_state.get("sent_log_error"):
-        st.caption("⚠️ " + (st.session_state.pop("sent_log_error", None) or SENT_LOG.last_error or ""))
-    elif SENT_LOG.backend == "local":
-        st.caption("Sent ticks reset when the app restarts. Add GITHUB_TOKEN & GITHUB_REPO to Secrets to keep them permanently.")
-    if st.button("↻ Refresh shared data", **FULL_WIDTH, help="Pick up ticks made by colleagues since you opened the app."):
-        st.session_state.pop("sent_log_data", None)
-        st.session_state.pop("call_list_data", None)
-        st.session_state.pop("contacts_data", None)
-        st.session_state.pop("zoho_fields", None)
-        st.session_state.pop("zoho_from", None)
-        st.session_state.pop("research_data", None)
-        st.session_state["call_ver"] = st.session_state.get("call_ver", 0) + 1
-        st.session_state["sent_log_ver"] = st.session_state.get("sent_log_ver", 0) + 1
-        bump_queue_editor()
-        st.rerun()
+        get_sent_log()
+        if SENT_LOG.last_error or st.session_state.get("sent_log_error"):
+            log_state = 'off">Error'
+        elif SENT_LOG.backend == "github":
+            log_state = 'ok">Saved to GitHub'
+        else:
+            log_state = 'idle">Temporary'
+        render_html(f'<div class="pe-status">Sent log<span class="st {log_state}</span></div>')
+        call_state = ('off">Error' if CALL_STORE.last_error else 'ok">Saved to GitHub' if CALL_STORE.backend == "github" else 'idle">Temporary')
+        render_html(f'<div class="pe-status">Call list<span class="st {call_state}</span></div>')
+        places_state = 'ok">Connected' if _secret_value("GOOGLE_PLACES_API_KEY") else 'idle">Not set up'
+        render_html(f'<div class="pe-status">Google Maps lookup<span class="st {places_state}</span></div>')
+        fca_state = 'ok">Connected' if _secret_value("FCA_API_KEY") and _secret_value("FCA_API_EMAIL") else 'idle">Add free key'
+        sra_state = 'ok">Connected' if _secret_value("SRA_API_KEY") else 'idle">Add free key'
+        render_html(
+            '<div class="pe-status">OpenStreetMap<span class="st ok">Free · ready</span></div>'
+            '<div class="pe-status">Email domain checks<span class="st ok">Free · ready</span></div>'
+            '<div class="pe-status">Owners (Companies House)<span class="st ok">Free · ready</span></div>'
+            f'<div class="pe-status">FCA register<span class="st {fca_state}</span></div>'
+            f'<div class="pe-status">SRA register<span class="st {sra_state}</span></div>'
+        )
+        if SENT_LOG.last_error or st.session_state.get("sent_log_error"):
+            st.caption("⚠️ " + (st.session_state.pop("sent_log_error", None) or SENT_LOG.last_error or ""))
+        elif SENT_LOG.backend == "local":
+            st.caption("Sent ticks reset when the app restarts. Add GITHUB_TOKEN & GITHUB_REPO to Secrets to keep them permanently.")
+        if st.button("↻ Refresh shared data", **FULL_WIDTH, help="Pick up ticks made by colleagues since you opened the app."):
+            st.session_state.pop("sent_log_data", None)
+            st.session_state.pop("call_list_data", None)
+            st.session_state.pop("contacts_data", None)
+            st.session_state.pop("zoho_fields", None)
+            st.session_state.pop("zoho_from", None)
+            st.session_state.pop("research_data", None)
+            st.session_state["call_ver"] = st.session_state.get("call_ver", 0) + 1
+            st.session_state["sent_log_ver"] = st.session_state.get("sent_log_ver", 0) + 1
+            bump_queue_editor()
+            st.rerun()
     render_html('<div class="pe-side-h">This session</div>')
     sidebar_stats_slot = st.empty()
     render_html('<div class="pe-side-h">Your email signature</div>')
@@ -4684,7 +4723,7 @@ with st.sidebar:
             except Exception:
                 return default
         prof = st.session_state.setdefault("sender_profile", {
-            "name": _secret("SENDER_NAME", ""),
+            "name": st.session_state.get("cleanse_user") or _secret("SENDER_NAME", ""),
             "title": _secret("SENDER_TITLE", SENDER_DEFAULTS["title"]),
             "phone": _secret("SENDER_PHONE", SENDER_DEFAULTS["phone"]),
             "email": _secret("SENDER_EMAIL", SENDER_DEFAULTS["email"]),
@@ -4700,6 +4739,8 @@ with st.sidebar:
     render_html('<div class="pe-side-h">Account</div>')
     if st.button("Log out", **FULL_WIDTH):
         st.session_state["password_correct"] = False
+        for _k in ("role", "cleanse_user", "view"):
+            st.session_state.pop(_k, None)
         st.rerun()
 
 # ---------------- CALL LIST PAGE ----------------
@@ -5291,6 +5332,8 @@ def render_crm_table(df: pd.DataFrame, key: str):
         "Area": st.column_config.TextColumn("Area", width=110),
         "Sector": st.column_config.TextColumn("Likely sector", width=120, help="First guess from the name / Zoho industry"),
         "Contact": st.column_config.TextColumn("Contact", width=110),
+        "Updated": st.column_config.DatetimeColumn("Updated", format="D MMM, HH:mm", width=96,
+                                                   help="Last edited in Zoho, e.g. when an email was added"),
         "Gaps": st.column_config.TextColumn("Missing", width=110, help="What Zoho doesn't have yet. Enrichment tries to fill these."),
         "Contacted": st.column_config.TextColumn("Worked", width=96, help="✓ emailed · 📞 on the call list · 🔎 researched recently"),
         "Email": st.column_config.TextColumn("Email", width=150),
@@ -5652,6 +5695,8 @@ with col_left:
             statuses = (ZOHO.lead_statuses(st.session_state["zoho_fields"]) or ["Not Contacted"]) + [NO_VALUE]
             remembered = [x for x in _qp_list("status") if x in statuses]
             default_status = remembered or [s for s in statuses if s.lower() == "not contacted"] or statuses[:1]
+            if CLEANSE_MODE and not remembered:  # Cleansed leads can be in any open status, or none
+                default_status = [s for s in statuses if not any(w in s.lower() for w in ("junk", "lost", "not qualified"))]
             # Keyed widget, set up once: clearing it and picking one status keeps just that status
             if "f_status" not in st.session_state:
                 st.session_state["f_status"] = default_status
@@ -5661,6 +5706,9 @@ with col_left:
             all_sources = ZOHO.picklist_values(st.session_state["zoho_fields"], "Lead_Source") + [NO_VALUE]
             if "f_load_sources" not in st.session_state:
                 st.session_state["f_load_sources"] = [x for x in _qp_list("lsrc") if x in all_sources]
+                if CLEANSE_MODE and not st.session_state["f_load_sources"]:  # Their batches, e.g. Ginger and Silverback
+                    wanted = {w.lower() for w in CLEANSE_SOURCES}
+                    st.session_state["f_load_sources"] = [x for x in all_sources if x.lower() in wanted]
             else:
                 st.session_state["f_load_sources"] = [x for x in st.session_state["f_load_sources"] if x in all_sources]
             s_col1, s_col2 = st.columns(2)
@@ -5674,7 +5722,7 @@ with col_left:
                                                      f" batches you want to work, e.g. Ginger or Silverback. '{NO_VALUE}'"
                                                      " means leads with no source set.")
             if "f_email_only" not in st.session_state:
-                st.session_state["f_email_only"] = _qp_list("email") != ["all"]
+                st.session_state["f_email_only"] = CLEANSE_MODE or _qp_list("email") != ["all"]
             email_only = st.toggle("Only leads with an email in Zoho", key="f_email_only",
                                    help="On: loads just the leads that already have an email address, like the MY PA"
                                         " engine, so every batch can be emailed. Off: loads every lead, and enrichment"
@@ -5686,7 +5734,8 @@ with col_left:
             if load_btn:
                 with st.spinner("Pulling leads from Zoho CRM…"):
                     try:
-                        recs = ZOHO.leads(chosen_statuses, st.session_state["zoho_fields"], chosen_sources, email_only)
+                        recs = ZOHO.leads(chosen_statuses, st.session_state["zoho_fields"], chosen_sources, email_only,
+                                          order_by="Modified_Time" if CLEANSE_MODE else "Created_Time")
                         load_error = None
                     except ZohoError as exc:
                         recs, load_error = [], str(exc)
@@ -5799,7 +5848,8 @@ with col_left:
                 sources = sorted({r.get("Lead_Source") or "—" for r in recs_all})
                 src = st.multiselect("Lead source", sources, placeholder="All sources")
             with f3:
-                order = st.selectbox("Order", ["Newest first", "Oldest first"],
+                order = st.selectbox("Order", [ORDER_UPDATED, "Newest first", "Oldest first"],
+                                     index=0 if CLEANSE_MODE else 1, key="f_order",
                                      help="Which end of the list today's batch comes from.")
             g3, _g4 = st.columns(2)
             with g3:
@@ -5834,7 +5884,10 @@ with col_left:
                 and (not hide_done or not _done(r))
                 and (other_mode == "Include" or ((r["id"] in other_sent) == (other_mode == "Only these")))
             ]
-            recs.sort(key=lambda r: r.get("Created_Time") or "", reverse=(order == "Newest first"))
+            if order == ORDER_UPDATED:  # e.g. leads where someone has just added an email in Zoho
+                recs.sort(key=lambda r: r.get("Modified_Time") or "", reverse=True)
+            else:
+                recs.sort(key=lambda r: r.get("Created_Time") or "", reverse=(order == "Newest first"))
 
             def _status_label(r: Dict[str, Any]) -> str:
                 if r["id"] in log_now:
@@ -5874,9 +5927,11 @@ with col_left:
                     "Phone": r.get("Phone") or r.get("Mobile") or "",
                     "Source": r.get("Lead_Source") or "",
                     "Created": pd.to_datetime(r.get("Created_Time"), errors="coerce", utc=True),
+                    "Updated": pd.to_datetime(r.get("Modified_Time"), errors="coerce", utc=True),
                     "Zoho": ZOHO.record_url(r["id"]),
                 } for r in recs])
                 df["Created"] = pd.to_datetime(df["Created"], errors="coerce", utc=True).dt.tz_localize(None)
+                df["Updated"] = pd.to_datetime(df["Updated"], errors="coerce", utc=True).dt.tz_convert("Europe/London").dt.tz_localize(None)
                 filt_sig = abs(hash((q, tuple(src), gaps_only, hide_done, order, tuple(sorted(wanted_areas)),
                                      tuple(sorted(wanted_sectors))))) % 10**6
                 table_event = render_crm_table(df, key=f"crm_table_{st.session_state.get('search_version', 0)}_{filt_sig}")
@@ -6421,12 +6476,20 @@ def render_zoho_send_panel(ready_sel: List[str], log_now: Dict[str, Any]) -> Non
         statuses = ZOHO.lead_statuses(st.session_state.get("zoho_fields") or {})
         status_opts = ([ZS_DEFAULT_STATUS] if any(s.lower() == "attempted to contact" for s in statuses) else []) \
             + [s for s in statuses if s.lower() != "attempted to contact"] + [ZS_NO_CHANGE]
+        if CLEANSE_MODE and not cleanse_sender(senders):
+            st.error(f"Zoho won't send from {CLEANSE_FROM} yet, so nothing can be sent. Sam needs to add it in Zoho CRM:"
+                     " Setup → Channels → Email → Organization Emails → Add, then click the link in the verification"
+                     " email that arrives in that inbox.")
+            return
         c1, c2 = st.columns(2)
         with c1:
-            st.selectbox("Send from", list(range(len(senders))), key="zs_from",
-                         format_func=lambda i: f"{senders[i].get('user_name') or ''} <{senders[i]['email']}>".strip()
-                         + (" · org address" if senders[i].get("type") == "org_email" else ""),
-                         help="Addresses your Zoho account can send from. Replies come back to this address.")
+            if CLEANSE_MODE:
+                st.caption(f"✉️ Sending from **{esc(CLEANSE_FROM)}**")
+            else:
+                st.selectbox("Send from", list(range(len(senders))), key="zs_from",
+                             format_func=lambda i: f"{senders[i].get('user_name') or ''} <{senders[i]['email']}>".strip()
+                             + (" · org address" if senders[i].get("type") == "org_email" else ""),
+                             help="Addresses your Zoho account can send from. Replies come back to this address.")
         with c2:
             st.selectbox("Then set Lead Status to", status_opts, key="zs_status")
         st.toggle("Prepare only: update Zoho and add the pitch as a note, but don't send", key="zs_prepare",
