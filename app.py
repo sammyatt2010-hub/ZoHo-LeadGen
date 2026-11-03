@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import hmac
 import html as html_lib
 import io
@@ -13,7 +14,7 @@ from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from email.message import EmailMessage
 from email.utils import formatdate
-from urllib.parse import parse_qs, quote, quote_plus, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from fpdf import FPDF
@@ -2636,6 +2637,7 @@ def _email_plain_html(body: str) -> str:
             out.append(f'<ul style="margin:0 0 14px 0;padding-left:20px">{items}</ul>')
         else:
             text = "<br>".join(html_lib.escape(l) for l in block.split("\n"))
+            text = re.sub(r"(https?://[^\s<]+)", r'<a href="\1">\1</a>', text)
             style = "margin:0 0 14px 0"
             if block.startswith("P.S."):
                 style += ";color:#6b7280;font-size:12px"
@@ -2720,6 +2722,16 @@ def _email_branded_html(body: str, subject: str = "") -> str:
                 f'color:#ffffff;text-decoration:none;border-radius:8px">{label} &rarr;</a></td></tr></table></td></tr>')
             if rest.strip():
                 rows.append(para(rest.strip(), "text-align:center;font-size:14px;color:#4b5563;padding-top:10px"))
+            continue
+        m_link = re.match(r"^(.*?):\s*(https?://\S+)\s*$", first)
+        if m_link and "\n" not in first and "form" in m_link.group(1).lower():
+            rows.append(
+                f'<tr><td align="center" style="padding:8px 36px 18px 36px">'
+                f'<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>'
+                f'<td align="center" bgcolor="{teal}" style="border-radius:8px">'
+                f'<a href="{e(m_link.group(2))}" style="display:inline-block;padding:13px 30px;{font};font-size:15px;'
+                f'font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px">{e(m_link.group(1).strip())} &rarr;</a>'
+                f'</td></tr></table></td></tr>')
             continue
         if low.startswith("i've attached"):
             rows.append(para("\U0001F4CE " + block, "font-size:14px;color:#4b5563"))
@@ -4441,7 +4453,9 @@ def run_crm_enrichment(
 # ------------------------------------------------------------------
 def zoho_sent_today(log: Dict[str, Any]) -> int:
     today = now_uk().date().isoformat()
-    return sum(1 for r in log.values() if r.get("via") == "zoho" and str(r.get("sent_at", "")).startswith(today))
+    return sum(1 for r in log.values() if r.get("via") == "zoho" and str(r.get("sent_at", "")).startswith(today)) \
+        + sum(1 for r in log.values() if r.get("survey_kind") == "follow_up"
+              and str(r.get("survey_sent_at", "")).startswith(today))
 
 
 def zoho_senders() -> Tuple[List[Dict[str, Any]], Optional[str]]:
@@ -4452,6 +4466,411 @@ def zoho_senders() -> Tuple[List[Dict[str, Any]], Optional[str]]:
         except ZohoError as exc:
             return [], str(exc)
     return st.session_state["zoho_from"], None
+
+
+SURVEY_APP = "Lead Revival"
+
+
+def survey_lead_id(key: str, rec: Dict[str, Any]) -> str:
+    k = str(key)  # Lead Revival logs by Zoho lead id
+    return k if k.isdigit() and len(k) > 10 else ""
+
+
+# ---------------- Survey form (hosted on Zoho Forms) ----------------
+SURVEY_TAG = _secret_value("SURVEY_TAG", "Survey sent")
+SURVEY_DONE_TAG = _secret_value("SURVEY_DONE_TAG", "Survey completed")
+SURVEY_DONE_FIELD = _secret_value("SURVEY_DONE_FIELD", "Survey_Completed")
+SURVEY_KIND_PITCH = "Pitch email (with PDF)"
+SURVEY_KIND_FORM = "Survey form (2-minute questionnaire)"
+SURVEY_FILTERS = ["Not surveyed yet", "Survey sent, not completed", "Survey completed", "Everyone"]
+
+
+def survey_form_url() -> str:
+    return _secret_value("SURVEY_FORM_URL").strip()
+
+
+SURVEY_SRC = "lr"
+
+
+def survey_signed() -> bool:
+    return bool(_secret_value("SURVEY_SIGNING_KEY"))
+
+
+def survey_link(lead_id: str, company: str, contact: str, email: str, phone: str = "") -> str:
+    """The form link with the lead's details filled in.
+    Our own survey app (SURVEY_SIGNING_KEY set): signed, so the answers go straight onto this lead.
+    Zoho Forms: 'field alias' prefill. Anything else (CRM webform, short link): the plain link."""
+    base = survey_form_url()
+    if not base:
+        return ""
+    key = _secret_value("SURVEY_SIGNING_KEY")
+    if key and lead_id:
+        q = {k: v for k, v in {"lid": lead_id, "c": company, "n": contact, "e": email, "p": phone,
+                                "src": SURVEY_SRC}.items() if v}
+        q["s"] = hmac.new(key.encode(), f"{lead_id}|{(email or '').strip().lower()}".encode(),
+                          hashlib.sha256).hexdigest()[:20]
+        return base + ("&" if "?" in base else "?") + urlencode(q)
+    if not any(h in base for h in ("forms.zohopublic", "forms.zoho.")):
+        return base  # CRM webform / short link: it can't prefill, so send the plain link
+    q = {"ZohoLeadId": lead_id, "CompanyName": company, "ContactName": contact, "Email": email, "Phone": phone}
+    return base + ("&" if "?" in base else "?") + urlencode({k: v for k, v in q.items() if v})
+
+
+def survey_email(first: str, company: str, link: str, follow_up: bool, sector_plural: str = "",
+                 email: str = "") -> Tuple[str, str]:
+    """(subject, plain-text body). The branded HTML turns the 'form: link' line into a button."""
+    hello = f"Hi {first}," if first and first not in ("Team", "there") else "Hello,"
+    if follow_up:
+        subject = f"A quick 2-minute form for {company}"
+        intro = (f"I emailed recently about a phone system that works with the software {company} already uses, "
+                 "so calls, contacts and call notes all sit in one place.")
+    else:
+        subject = f"Your phone system, {company}: a quick 2-minute form"
+        who = sector_plural or "businesses"
+        intro = (f"We help {who} like {company} move to modern cloud phones that work with the software they "
+                 "already use, so calls, contacts and call notes all sit in one place.")
+    body = "\n\n".join([
+        hello,
+        intro,
+        "To put together an accurate, no-obligation quote, could you spare two minutes for this short form? "
+        "It covers your sites, users, handsets and phone numbers, so we don't need to take up your time with a long call."
+        + (f" Please use this email address ({email}) on the form, so your answers link straight to your enquiry."
+           if email else ""),
+        f"Fill in the 2-minute form: {link}",
+        "Rather talk it through? Just reply with a good time to call.",
+        build_signature(get_sender()),
+        "P.S. Not the right time? Just reply \"no thanks\" and I won't chase.",
+    ])
+    return subject, body
+
+
+def survey_status(tags: List[str], done_value: Any = None, rec: Optional[Dict[str, Any]] = None) -> str:
+    low = [t.lower() for t in tags or []]
+    if any(w in t for t in low for w in BLOCKED_SURVEY_WORDS):
+        return "⛔ Not interested"
+    if done_value in (True, "true", "Yes", "yes", "TRUE") or SURVEY_DONE_TAG.lower() in low:
+        return "✅ Completed"
+    if SURVEY_TAG.lower() in low or (rec or {}).get("survey_sent_at"):
+        return "📨 Sent"
+    return "—"
+
+
+BLOCKED_SURVEY_WORDS = ("not interested",)
+
+
+def zoho_survey_info(ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """{lead id: {'tags': [...], 'done': value}} for up to a few hundred leads (100 per call)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    use_done = True
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        body = None
+        if use_done and SURVEY_DONE_FIELD:
+            try:
+                body = ZOHO._request("GET", "/crm/v8/Leads",
+                                     params={"ids": ",".join(chunk), "fields": f"Tag,{SURVEY_DONE_FIELD}"})
+            except ZohoError:
+                use_done = False  # The 'survey completed' field isn't in Zoho (yet): tags only
+        if body is None:
+            body = ZOHO._request("GET", "/crm/v8/Leads", params={"ids": ",".join(chunk), "fields": "Tag"})
+        for r in (body or {}).get("data") or []:
+            out[str(r.get("id"))] = {
+                "tags": [str(t.get("name") if isinstance(t, dict) else t) for t in (r.get("Tag") or [])],
+                "done": r.get(SURVEY_DONE_FIELD) if use_done else None}
+    return out
+
+
+def zoho_add_tag(record_id: str, tag: str) -> None:
+    """Adds a tag to a lead (Zoho creates the tag the first time it's used)."""
+    body = ZOHO._request("POST", f"/crm/v8/Leads/{record_id}/actions/add_tags",
+                         json={"tags": [{"name": tag}], "over_write": False})
+    row = ((body or {}).get("data") or [{}])[0]
+    if row.get("status") not in ("success", None) and row.get("code") not in ("SUCCESS", None):
+        raise ZohoError(f"Zoho CRM error: {row.get('message') or row.get('code') or 'tag not added'}")
+
+
+def survey_sent_today(log: Dict[str, Any]) -> int:
+    """Survey follow-ups sent today (first-contact surveys are already counted as normal sends)."""
+    today = now_uk().date().isoformat()
+    return sum(1 for r in log.values() if r.get("survey_kind") == "follow_up"
+               and str(r.get("survey_sent_at", "")).startswith(today))
+
+
+def send_surveys(targets: List[Dict[str, Any]], sender: Optional[Dict[str, Any]], follow_up: bool,
+                 origin: str = "survey", new_status: Optional[str] = None) -> None:
+    """Emails the survey form link from Zoho to each target, adds a note and the 'Survey sent' tag.
+    target = {key, lead_id, company, contact, email, phone, sector_plural, record}"""
+    done, problems = [], []
+    changes: Dict[str, Dict[str, Any]] = {}
+    log = get_sent_log()
+    who = get_sender().get("name") or SURVEY_APP
+    stamp = now_uk().strftime("%d %b %Y %H:%M")
+    progress = st.progress(0.0, text="Sending survey forms through Zoho…")
+    try:
+        for n, t in enumerate(targets, start=1):
+            name = t.get("company") or t.get("email") or "Lead"
+            progress.progress(n / max(1, len(targets)), text=f"Sending {n} of {len(targets)} · {name}")
+            to = (t.get("email") or "").strip()
+            if not t.get("lead_id"):
+                problems.append(f"{name}: not a Zoho lead, so no survey was sent")
+                continue
+            if not to or not sender:
+                problems.append(f"{name}: no valid email address" if sender else f"{name}: no From address in Zoho")
+                continue
+            contact = t.get("contact") or ""
+            first = contact.split()[0] if contact and contact not in ("Team", "there") else ""
+            link = survey_link(t["lead_id"], t.get("company", ""), "" if contact in ("Team", "there") else contact,
+                               to, t.get("phone", ""))
+            subject, body = survey_email(first, t.get("company", ""), link, follow_up, t.get("sector_plural", ""),
+                                          "" if survey_signed() else to)
+            try:
+                ZOHO.send_mail(t["lead_id"], sender, to, "" if contact in ("Team", "there") else contact,
+                               subject, _email_body_html(body, subject), [])
+            except ZohoError as exc:
+                problems.append(f"{name}: not sent. {exc}")
+                continue
+            try:
+                if new_status:
+                    ZOHO.update_lead(t["lead_id"], {"Lead_Status": new_status})
+                ZOHO.add_note(t["lead_id"], f"{SURVEY_APP}: survey form emailed",
+                              f"Survey form {'follow-up ' if follow_up else ''}emailed by {who} via {SURVEY_APP} on {stamp}."
+                              f"\nTo: {to}\nSubject: {subject}\nForm: {link}")
+            except ZohoError as exc:
+                problems.append(f"{name}: sent, but the note wasn't added. {exc}")
+            try:
+                zoho_add_tag(t["lead_id"], SURVEY_TAG)
+            except ZohoError as exc:
+                problems.append(f"{name}: sent, but the '{SURVEY_TAG}' tag wasn't added. {exc}")
+            now_iso = now_uk().isoformat(timespec="seconds")
+            rec = dict(log.get(t["key"]) or t.get("record") or {})
+            rec.update(survey_sent_at=now_iso, survey_sent_by=who, survey_from=sender.get("email", ""),
+                       survey_kind="follow_up" if follow_up else "first")
+            if not follow_up:  # First contact: the survey IS the email, so log it like a send
+                rec.update(via="zoho", status="Survey sent via Zoho", subject=subject, sent_at=now_iso, sent_by=who,
+                           to=to, from_address=sender.get("email", ""))
+            changes[t["key"]] = rec
+            if len(changes) >= 5:  # Save as we go
+                record_sent(dict(changes))
+                changes.clear()
+            done.append(name)
+    finally:
+        if changes:
+            try:
+                record_sent(dict(changes))
+            except BaseException:
+                save_log_quietly(SENT_LOG, dict(changes), f"{SURVEY_APP}: surveys saved after the page was interrupted")
+                raise
+            changes.clear()
+    progress.empty()
+    st.session_state.pop("survey_info", None)  # Re-read survey status next time
+    st.session_state["zoho_push_result"] = {"done": done, "problems": problems, "origin": origin, "prepare": False}
+
+
+SURVEY_SOURCE = _secret_value("SURVEY_LEAD_SOURCE", "Survey form")
+SURVEY_LEAD_ID_FIELD = _secret_value("SURVEY_LEAD_ID_FIELD", "Survey_Lead_ID")
+
+
+def survey_leftovers() -> List[Dict[str, Any]]:
+    """The extra leads the webform leaves behind once its answers have been copied onto the original lead."""
+    src = SURVEY_SOURCE.replace("'", "\\'")
+    q = (f"select id, Company, Email, Created_Time from Leads where Lead_Source = '{src}' "
+         f"and {SURVEY_LEAD_ID_FIELD} is not null order by Created_Time desc limit 0, 200")
+    body = ZOHO._request("POST", "/crm/v8/coql", json={"select_query": q})
+    return (body or {}).get("data") or []
+
+
+def delete_zoho_leads(ids: List[str]) -> int:
+    """Moves leads to Zoho's recycle bin (restorable there for 60 days). Returns how many went."""
+    gone = 0
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        body = ZOHO._request("DELETE", "/crm/v8/Leads", params={"ids": ",".join(chunk)}) or {}
+        gone += sum(1 for r in body.get("data") or [] if r.get("status") == "success")
+    return gone
+
+
+def render_survey_tidy() -> None:
+    with st.expander("🧹  Tidy up leftover survey leads", expanded=False):
+        st.caption(f"Each form submission creates a spare lead (Lead Source '{SURVEY_SOURCE}') once its answers are"
+                   " copied onto the original lead. This finds those spares and moves them to Zoho's recycle bin."
+                   " Forwarded forms that matched no lead are kept.")
+        if st.session_state.get("survey_tidy_msg"):
+            st.success(st.session_state.pop("survey_tidy_msg"))
+        if st.button("Find leftover survey leads", key="sv_tidy_find"):
+            try:
+                st.session_state["survey_leftovers"] = survey_leftovers()
+            except ZohoError as exc:
+                st.session_state.pop("survey_leftovers", None)
+                st.error(f"Couldn't search Zoho: {exc}. If the field name differs, set SURVEY_LEAD_ID_FIELD in Secrets"
+                         f" to the Survey Lead ID field's API name (currently {SURVEY_LEAD_ID_FIELD}).")
+        found = st.session_state.get("survey_leftovers")
+        if found is None:
+            return
+        if not found:
+            st.info("Nothing to tidy: no leftover survey leads.")
+            return
+        st.dataframe(pd.DataFrame([{"Company": r.get("Company") or "", "Email": r.get("Email") or "",
+                                    "Submitted": str(r.get("Created_Time") or "")[:16].replace("T", " ")} for r in found]),
+                     hide_index=True, **FULL_WIDTH)
+        try:
+            pop = st.popover(f"🗑  Move {len(found)} to the recycle bin", **FULL_WIDTH)
+        except TypeError:
+            pop = st.popover(f"🗑  Move {len(found)} to the recycle bin")
+        with pop:
+            st.markdown(f"Move **{len(found)}** spare survey leads to Zoho's recycle bin?")
+            st.caption("The original leads keep the answers. These can be restored from the recycle bin for 60 days.")
+            if st.button("Yes, tidy them up", type="primary", key="sv_tidy_go", **FULL_WIDTH):
+                try:
+                    n = delete_zoho_leads([str(r["id"]) for r in found if r.get("id")])
+                    st.session_state["survey_tidy_msg"] = f"{n} leftover survey lead(s) moved to the recycle bin."
+                except ZohoError as exc:
+                    st.session_state["survey_tidy_msg"] = f"Stopped part way: {exc}"
+                st.session_state.pop("survey_leftovers", None)
+                st.rerun()
+
+
+SURVEY_RESPONSES = SentLog("GITHUB_SURVEY_PATH", "survey_responses.json", ".survey_responses.json")
+
+
+def survey_days_ago(rec: Dict[str, Any]) -> Optional[int]:
+    try:
+        sent = datetime.fromisoformat(str(rec.get("sent_at")))
+        if sent.tzinfo is None:
+            sent = sent.replace(tzinfo=now_uk().tzinfo)
+        return max(0, (now_uk() - sent).days)
+    except Exception:
+        return None
+
+
+def render_survey_page() -> None:
+    """Survey follow-ups: leads this app has already emailed, sent the 2-minute form as a follow-up."""
+    section_header("01", "Survey follow-ups",
+                   "Send the 2-minute survey form to leads this app has already emailed")
+    if not survey_form_url():
+        st.info("Add the form link first: in this app's Streamlit Secrets add  SURVEY_FORM_URL = \"https://forms.zohopublic.eu/…\""
+                "  (from Zoho Forms → Share → Public link), save, and reboot.")
+        return
+    if not ZOHO.configured:
+        st.warning("Zoho isn't connected, so surveys can't be sent.")
+        return
+    show_zoho_push_result("survey")
+    render_survey_tidy()
+    log = get_sent_log()
+    rows = []
+    for key, r in log.items():
+        if not r or not (r.get("to") or "").strip():
+            continue
+        lead_id = survey_lead_id(key, r)
+        if not lead_id:
+            continue
+        rows.append((key, lead_id, r))
+    if not rows:
+        st.caption("No emailed Zoho leads in this app's sent log yet.")
+        return
+    c1, c2, c3 = st.columns([1, 1.4, 1.6])
+    with c1:
+        min_days = st.number_input("Emailed at least this many days ago", 0, 365, 3, key="sv_days")
+    with c2:
+        which = st.selectbox("Show", SURVEY_FILTERS, key="sv_filter")
+    with c3:
+        find = st.text_input("Search", key="sv_find", placeholder="Company, name or email")
+    if "survey_info" not in st.session_state or st.button("↻  Re-check survey status in Zoho", key="sv_refresh"):
+        with st.spinner("Checking tags in Zoho…"):
+            try:
+                st.session_state["survey_info"] = zoho_survey_info(sorted({lid for _, lid, _ in rows}))
+            except ZohoError as exc:
+                st.session_state["survey_info"] = {}
+                st.warning(f"Couldn't read survey status from Zoho: {exc}")
+    info = st.session_state.get("survey_info") or {}
+    if "survey_responses" not in st.session_state or st.session_state.get("sv_refresh"):
+        done_by: Dict[str, str] = {}
+        for resp in SURVEY_RESPONSES.load().values():
+            if isinstance(resp, dict):
+                for lid in {str(resp.get("lead_id") or ""), str(resp.get("link_lead_id") or "")} - {""}:
+                    done_by[lid] = max(done_by.get(lid, ""), str(resp.get("submitted_at") or ""))
+        st.session_state["survey_responses"] = done_by
+    responses = st.session_state.get("survey_responses") or {}
+    table = []
+    for key, lead_id, r in rows:
+        days = survey_days_ago(r)
+        if days is None or days < min_days:
+            continue
+        i_ = info.get(lead_id) or {}
+        status = survey_status(i_.get("tags") or [], i_.get("done") or bool(responses.get(lead_id)), r)
+        if status == "⛔ Not interested":
+            continue
+        if which == "Not surveyed yet" and status != "—":
+            continue
+        if which == "Survey sent, not completed" and status != "📨 Sent":
+            continue
+        if which == "Survey completed" and status != "✅ Completed":
+            continue
+        hay = " ".join(str(r.get(k, "")) for k in ("company_name", "contact", "to")).lower()
+        if find and find.lower() not in hay:
+            continue
+        table.append({"key": key, "lead_id": lead_id, "Send": False, "Company": r.get("company_name") or "",
+                      "Contact": r.get("contact") if r.get("contact") not in ("Team", "there") else "",
+                      "Email": r.get("to") or "", "Emailed": str(r.get("sent_at", ""))[:10], "Days": days,
+                      "Survey": status, "Sent on": str(r.get("survey_sent_at", ""))[:10]})
+    table.sort(key=lambda x: -x["Days"])
+    st.caption(f"{len(table)} lead(s) match. Tick the ones to send the survey to. Leads tagged Not Interested are always left out.")
+    if not table:
+        return
+    pick_all = st.toggle("Tick all shown (not yet surveyed only)", key="sv_all")
+    for row in table:
+        row["Send"] = bool(pick_all and row["Survey"] == "—")
+    df = pd.DataFrame(table)
+    edited = st.data_editor(
+        df, hide_index=True, key=f"sv_editor_{st.session_state.get('sent_log_ver', 0)}_{int(pick_all)}",
+        column_order=["Send", "Company", "Contact", "Email", "Emailed", "Days", "Survey", "Sent on"],
+        disabled=["Company", "Contact", "Email", "Emailed", "Days", "Survey", "Sent on"],
+        column_config={"Send": st.column_config.CheckboxColumn("Send", width=60),
+                       "Days": st.column_config.NumberColumn("Days ago", width=70),
+                       "Survey": st.column_config.TextColumn("Survey", width=110)},
+        height=min(38 + 35 * len(df), 460), **FULL_WIDTH)
+    chosen = [table[i] for i, v in enumerate(list(edited["Send"])) if v]
+    resend = sum(1 for c in chosen if c["Survey"] != "—")
+    if resend:
+        st.caption(f"⚠️ {resend} of the ticked leads have already had the survey; they'll get it again.")
+    senders, err = zoho_senders()
+    if err or not senders:
+        st.error(err or "Zoho didn't return any address to send from.")
+        return
+    st.selectbox("Send from", list(range(len(senders))), key="sv_from",
+                 format_func=lambda i: f"{senders[i].get('user_name') or ''} <{senders[i]['email']}>".strip()
+                 + (" · org address" if senders[i].get("type") == "org_email" else ""))
+    sent_today = zoho_sent_today(log)
+    left = max(0, ZOHO_SEND_LIMIT - sent_today)
+    if len(chosen) > left:
+        st.warning(f"Zoho allows {ZOHO_SEND_LIMIT} emails a day and {sent_today} have gone today, so only the first {left} will be sent.")
+        chosen = chosen[:left]
+    label = f"📋  Send the survey to {len(chosen)} {'lead' if len(chosen) == 1 else 'leads'}"
+    try:
+        pop = st.popover(label, key=f"sv_pop_{st.session_state.get('sent_log_ver', 0)}", disabled=not chosen, **FULL_WIDTH)
+    except TypeError:
+        pop = st.popover(label, disabled=not chosen, **FULL_WIDTH)
+    with pop:
+        idx = st.session_state.get("sv_from", 0)
+        frm = senders[idx] if isinstance(idx, int) and 0 <= idx < len(senders) else senders[0]
+        st.markdown(f"Email the survey form to **{len(chosen)}** now from **{esc(frm['email'])}**?")
+        st.caption(f"Each lead gets a note and the '{SURVEY_TAG}' tag in Zoho. This can't be undone.")
+        if st.button("Yes, send the survey", type="primary", key="sv_confirm", **FULL_WIDTH):
+            targets = []
+            for c in chosen:
+                r = log.get(c["key"]) or {}
+                targets.append({"key": c["key"], "lead_id": c["lead_id"], "company": c["Company"],
+                                "contact": r.get("contact") or "", "email": c["Email"], "phone": r.get("phone") or "",
+                                "sector_plural": survey_sector_plural(r.get("vertical")), "record": r})
+            send_surveys(targets, frm, follow_up=True, origin="survey")
+            st.rerun()
+    st.caption(f"Sent via Zoho today: {sent_today} of {ZOHO_SEND_LIMIT}.")
+
+
+def survey_sector_plural(vertical: Optional[str]) -> str:
+    try:
+        return SECTOR_COPY.get(vertical or "", {}).get("sector_plural", "")
+    except Exception:
+        return ""
 
 
 def cleanse_sender(senders: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -4483,13 +4902,47 @@ ZS_NO_CHANGE = "Don't change it"
 
 
 def push_to_zoho(ids: List[str], sender: Optional[Dict[str, Any]], new_status: Optional[str], prepare_only: bool,
-                 origin: str = "panel") -> None:
+                 origin: str = "panel", survey: bool = False) -> None:
     """Sends each lead's email through Zoho (or just prepares it), then fills blank fields and adds a note.
     Results go into st.session_state['zoho_push_result'] for display after the rerun."""
     done, problems = [], []
     sent_changes: Dict[str, Optional[Dict[str, Any]]] = {}
     who = get_sender().get("name") or "Lead Revival"
     stamp = now_uk().strftime("%d %b %Y %H:%M")
+    if survey and not prepare_only:  # The 2-minute survey form as the email (no PDF)
+        targets = []
+        for cn in ids:
+            item = queue.get(cn)
+            if not item:
+                continue
+            lead_s: ScrapedLead = item["lead"]
+            nm = lead_display_name(lead_s)
+            ensure_draft(item)
+            to_s = (item.get("to") or "").strip()
+            if not lead_s.crm_id:
+                problems.append(f"{nm}: not a Zoho lead")
+                continue
+            if lead_s.email_opt_out:
+                problems.append(f"{nm}: opted out of email in Zoho, not sent")
+                continue
+            if not to_s or not clean_email(to_s):
+                problems.append(f"{nm}: no valid email address")
+                continue
+            found = zoho_updates(lead_s, item)  # Still fill in blank fields found by enrichment
+            fields = {ZOHO_FIELD_API[k]: v for k, v in found.items() if k in ZOHO_FIELD_API}
+            if fields:
+                try:
+                    ZOHO.update_lead(lead_s.crm_id, fields)
+                except ZohoError as exc:
+                    problems.append(f"{nm}: fields not updated. {exc}")
+            targets.append({"key": cn, "lead_id": lead_s.crm_id, "company": nm,
+                            "contact": infer_contact_name_and_role(lead_s, item["vertical"])[0], "email": to_s,
+                            "phone": (lead_s.phones_found or [""])[0],
+                            "sector_plural": survey_sector_plural(item["vertical"]), "record": sent_record(item)})
+        send_surveys(targets, sender, follow_up=False, origin=origin, new_status=new_status)
+        st.session_state["zoho_push_result"]["problems"][:0] = problems
+        bump_queue_editor()
+        return
     progress = st.progress(0.0, text="Talking to Zoho…")
     try:
         for n, cn in enumerate(ids, start=1):
@@ -4635,9 +5088,9 @@ with st.sidebar:
     if CLEANSE_MODE:
         st.session_state["view"] = "prospect"
     if "view" not in st.session_state:
-        st.session_state["view"] = st.query_params.get("view") if st.query_params.get("view") in ("calls", "activity") else "prospect"
+        st.session_state["view"] = st.query_params.get("view") if st.query_params.get("view") in ("calls", "activity", "survey") else "prospect"
     _n_to_call = len(call_queue(get_call_list()))
-    _views = {"prospect": "🗂  Zoho leads", "calls": "📞  Call list", "activity": "📊  Activity"}
+    _views = {"prospect": "🗂  Zoho leads", "calls": "📞  Call list", "survey": "📋  Survey follow-ups", "activity": "📊  Activity"}
     if st.session_state["view"] not in _views:
         st.session_state["view"] = "prospect"
     if not CLEANSE_MODE:  # Data-cleanse logins only work Zoho leads
@@ -5271,6 +5724,18 @@ if st.session_state.get("view") == "activity":
         '<div class="pe-stats">'
         f'<div class="pe-stat"><div class="v">{sum(1 for e in _ev if e["Activity"] == "Emailed")}</div><div class="l">Emailed</div></div>'
         f'<div class="pe-stat"><div class="v">{sum(1 for e in _ev if e["Activity"] == "Call logged")}</div><div class="l">Calls</div></div>'
+        f'<div class="pe-stat"><div class="v">{len(call_queue(get_call_list()))}</div><div class="l">To call</div></div>'
+        "</div>",
+        target=sidebar_stats_slot,
+    )
+    st.stop()
+
+if st.session_state.get("view") == "survey" and not CLEANSE_MODE:
+    render_survey_page()
+    render_html(
+        '<div class="pe-stats">'
+        f'<div class="pe-stat"><div class="v">{sum(1 for r in get_sent_log().values() if r.get("survey_sent_at"))}</div><div class="l">Surveys sent</div></div>'
+        f'<div class="pe-stat"><div class="v">{len(get_sent_log())}</div><div class="l">Handled</div></div>'
         f'<div class="pe-stat"><div class="v">{len(call_queue(get_call_list()))}</div><div class="l">To call</div></div>'
         "</div>",
         target=sidebar_stats_slot,
@@ -6495,6 +6960,13 @@ def render_zoho_send_panel(ready_sel: List[str], log_now: Dict[str, Any]) -> Non
         st.toggle("Prepare only: update Zoho and add the pitch as a note, but don't send", key="zs_prepare",
                   help="For when someone wants to check the pitch in Zoho first.")
         prepare_only = bool(st.session_state.get("zs_prepare"))
+        st.radio("Email to send", [SURVEY_KIND_PITCH, SURVEY_KIND_FORM], key="zs_kind", horizontal=True,
+                 disabled=prepare_only,
+                 help="The survey is a short form (sites, users, handsets, numbers) that fills in the lead in Zoho.")
+        survey = st.session_state.get("zs_kind") == SURVEY_KIND_FORM and not prepare_only
+        if survey and not survey_form_url():
+            st.warning("The survey form link isn't set up yet: add SURVEY_FORM_URL to this app's Secrets.")
+            return
         sent_today = zoho_sent_today(log_now)
         left = max(0, ZOHO_SEND_LIMIT - sent_today)
         ids = [c for c in ready_sel if not queue[c]["lead"].email_opt_out]
@@ -6503,6 +6975,7 @@ def render_zoho_send_panel(ready_sel: List[str], log_now: Dict[str, Any]) -> Non
                        f" so only the first {left} will be sent.")
             ids = ids[:left]
         label = (f"📝  Prepare {len(ids)} in Zoho" if prepare_only
+                 else f"📋  Send the survey to {len(ids)} via Zoho" if survey
                  else f"🚀  Send {len(ids)} {'email' if len(ids) == 1 else 'emails'} via Zoho")
         pop_kwargs = dict(disabled=not ids, **FULL_WIDTH)
         try:
@@ -6514,12 +6987,13 @@ def render_zoho_send_panel(ready_sel: List[str], log_now: Dict[str, Any]) -> Non
             if prepare_only:
                 st.markdown(f"Update **{len(ids)} leads** in Zoho and add each pitch as a note? Nothing is emailed.")
             else:
-                st.markdown(f"Send **{len(ids)} emails** now from **{esc(sender['email']) if sender else '?'}**?")
+                st.markdown(f"Send **{len(ids)} {'survey forms' if survey else 'emails'}** now from"
+                            f" **{esc(sender['email']) if sender else '?'}**?")
                 st.caption("Keep this page open until it finishes. This can't be undone. Each email is logged on its Zoho lead"
                            + (f", and the Lead Status becomes {status}." if status else "."))
             if st.button("Yes, prepare them" if prepare_only else "Yes, send them now", type="primary",
                          key="zs_confirm", **FULL_WIDTH):
-                push_to_zoho(ids, sender, status, prepare_only)
+                push_to_zoho(ids, sender, status, prepare_only, survey=survey)
                 st.rerun()
         st.caption(f"Sent via Zoho today: {sent_today} of {ZOHO_SEND_LIMIT}.")
 
