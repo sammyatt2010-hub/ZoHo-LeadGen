@@ -4482,6 +4482,7 @@ SURVEY_DONE_TAG = _secret_value("SURVEY_DONE_TAG", "Survey completed")
 SURVEY_DONE_FIELD = _secret_value("SURVEY_DONE_FIELD", "Survey_Completed")
 SURVEY_KIND_PITCH = "Pitch email (with PDF)"
 SURVEY_KIND_FORM = "Survey form (2-minute questionnaire)"
+SURVEY_BATCH = 25  # Ticked at a time on the Survey follow-ups page
 SURVEY_FILTERS = ["Not surveyed yet", "Survey sent, not completed", "Survey completed", "Everyone"]
 
 
@@ -4816,12 +4817,37 @@ def render_survey_page() -> None:
     st.caption(f"{len(table)} lead(s) match. Tick the ones to send the survey to. Leads tagged Not Interested are always left out.")
     if not table:
         return
-    pick_all = st.toggle("Tick all shown (not yet surveyed only)", key="sv_all")
+    # Batches of 25: tick the first 25 not yet surveyed, then the next 25, and so on
+    eligible = [r["key"] for r in table if r["Survey"] == "—"]
+    ss = st.session_state
+    start = ss.get("sv_batch_start", 0)
+    if start >= len(eligible):
+        start = 0
+    b1, b2, b3 = st.columns(3)
+    if b1.button(f"☑  Select {SURVEY_BATCH}", key="sv_b_first", disabled=not eligible, **FULL_WIDTH,
+                 help=f"Ticks the first {SURVEY_BATCH} shown that haven't had the survey yet"):
+        start, ss["sv_batch_on"] = 0, True
+        ss["sv_sel_ver"] = ss.get("sv_sel_ver", 0) + 1
+    if b2.button(f"Select next {SURVEY_BATCH}  →", key="sv_b_next", **FULL_WIDTH,
+                 disabled=bool(not eligible or (ss.get("sv_batch_on") and start + SURVEY_BATCH >= len(eligible))),
+                 help=f"Skips to the following {SURVEY_BATCH} not yet surveyed"):
+        start = start + SURVEY_BATCH if ss.get("sv_batch_on") else 0
+        ss["sv_batch_on"] = True
+        ss["sv_sel_ver"] = ss.get("sv_sel_ver", 0) + 1
+    if b3.button("✕  Clear ticks", key="sv_b_clear", **FULL_WIDTH):
+        ss["sv_batch_on"] = False
+        ss["sv_sel_ver"] = ss.get("sv_sel_ver", 0) + 1
+    ss["sv_batch_start"] = start
+    picked = set(eligible[start:start + SURVEY_BATCH]) if ss.get("sv_batch_on") else set()
     for row in table:
-        row["Send"] = bool(pick_all and row["Survey"] == "—")
+        row["Send"] = row["key"] in picked
+    if picked:
+        st.caption(f"Ticked {start + 1}–{start + len(picked)} of {len(eligible)} not yet surveyed."
+                   " Untick any you'd rather skip, or tick extra ones yourself.")
     df = pd.DataFrame(table)
     edited = st.data_editor(
-        df, hide_index=True, key=f"sv_editor_{st.session_state.get('sent_log_ver', 0)}_{int(pick_all)}",
+        df, hide_index=True,
+        key=f"sv_editor_{st.session_state.get('sent_log_ver', 0)}_{ss.get('sv_sel_ver', 0)}_{which}_{min_days}",
         column_order=["Send", "Company", "Contact", "Email", "Emailed", "Days", "Survey", "Sent on"],
         disabled=["Company", "Contact", "Email", "Emailed", "Days", "Survey", "Sent on"],
         column_config={"Send": st.column_config.CheckboxColumn("Send", width=60),
@@ -4862,6 +4888,7 @@ def render_survey_page() -> None:
                                 "contact": r.get("contact") or "", "email": c["Email"], "phone": r.get("phone") or "",
                                 "sector_plural": survey_sector_plural(r.get("vertical")), "record": r})
             send_surveys(targets, frm, follow_up=True, origin="survey")
+            st.session_state["sv_batch_start"], st.session_state["sv_batch_on"] = 0, False
             st.rerun()
     st.caption(f"Sent via Zoho today: {sent_today} of {ZOHO_SEND_LIMIT}.")
 
