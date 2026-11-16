@@ -4483,7 +4483,21 @@ SURVEY_DONE_FIELD = _secret_value("SURVEY_DONE_FIELD", "Survey_Completed")
 SURVEY_KIND_PITCH = "Pitch email (with PDF)"
 SURVEY_KIND_FORM = "Survey form (2-minute questionnaire)"
 SURVEY_KIND_INTRO = "Intro + survey form (with PDF)"
-SURVEY_BATCH = 25  # Ticked at a time on the Survey follow-ups page
+SURVEY_BATCH = 25  # Default batch ticked at a time on the Surveys & outreach page
+SURVEY_BATCH_OPTIONS = [25, 50]  # Kept small on purpose: steady sending protects the mailbox's reputation
+
+
+def batch_size_picker(key: str, col) -> int:
+    """'Batch of 25 / 50' choice, shared by both survey pages. Changing it starts the selection again."""
+    def _reset() -> None:
+        for k in ("sv_new_on", "sv_batch_on"):
+            st.session_state[k] = False
+        for k in ("sv_new_start", "sv_batch_start"):
+            st.session_state[k] = 0
+    col.selectbox("Batch size", SURVEY_BATCH_OPTIONS, key=key, label_visibility="collapsed",
+                  format_func=lambda n: f"Batches of {n}", on_change=_reset,
+                  help="How many to tick at a time. 25 is the gentlest; 50 is fine once your sending is warmed up.")
+    return int(st.session_state.get(key) or SURVEY_BATCH)
 SURVEY_FILTERS = ["Not surveyed yet", "Survey sent, not completed", "Survey completed", "Everyone"]
 
 
@@ -5045,12 +5059,13 @@ def render_survey_outreach() -> None:
     start = ss.get("sv_new_start", 0)
     if start >= len(view):
         start = 0
-    b1, b2, b3 = st.columns(3)
-    if b1.button(f"☑  Select {SURVEY_BATCH}", key="sv_new_first", disabled=not view, **FULL_WIDTH):
+    b0, b1, b2, b3 = st.columns([1.1, 1, 1.2, 1])
+    batch = batch_size_picker("sv_batch_size", b0)
+    if b1.button(f"☑  Select {batch}", key="sv_new_first", disabled=not view, **FULL_WIDTH):
         start, ss["sv_new_on"] = 0, True
         ss["sv_new_ver"] = ss.get("sv_new_ver", 0) + 1
-    if b2.button(f"Select next {SURVEY_BATCH}  →", key="sv_new_next", disabled=not view, **FULL_WIDTH):
-        start = start + SURVEY_BATCH if ss.get("sv_new_on") else 0
+    if b2.button(f"Select next {batch}  →", key="sv_new_next", disabled=not view, **FULL_WIDTH):
+        start = start + batch if ss.get("sv_new_on") else 0
         if start >= len(view):
             start = 0
         ss["sv_new_on"] = True
@@ -5059,7 +5074,7 @@ def render_survey_outreach() -> None:
         ss["sv_new_on"] = False
         ss["sv_new_ver"] = ss.get("sv_new_ver", 0) + 1
     ss["sv_new_start"] = start
-    picked = {str(r.get("id")) for r in view[start:start + SURVEY_BATCH]} if ss.get("sv_new_on") else set()
+    picked = {str(r.get("id")) for r in view[start:start + batch]} if ss.get("sv_new_on") else set()
     if picked:
         st.caption(f"Ticked {start + 1}–{start + len(picked)} of {len(view)}. Untick any to skip, or tick extra ones.")
     df = pd.DataFrame([{
@@ -5232,22 +5247,23 @@ def render_survey_followups() -> None:
     start = ss.get("sv_batch_start", 0)
     if start >= len(eligible):
         start = 0
-    b1, b2, b3 = st.columns(3)
-    if b1.button(f"☑  Select {SURVEY_BATCH}", key="sv_b_first", disabled=not eligible, **FULL_WIDTH,
-                 help=f"Ticks the first {SURVEY_BATCH} shown that haven't had the survey yet"):
+    b0, b1, b2, b3 = st.columns([1.1, 1, 1.2, 1])
+    batch = batch_size_picker("sv_batch_size_fu", b0)
+    if b1.button(f"☑  Select {batch}", key="sv_b_first", disabled=not eligible, **FULL_WIDTH,
+                 help=f"Ticks the first {batch} shown that haven't had the survey yet"):
         start, ss["sv_batch_on"] = 0, True
         ss["sv_sel_ver"] = ss.get("sv_sel_ver", 0) + 1
-    if b2.button(f"Select next {SURVEY_BATCH}  →", key="sv_b_next", **FULL_WIDTH,
-                 disabled=bool(not eligible or (ss.get("sv_batch_on") and start + SURVEY_BATCH >= len(eligible))),
-                 help=f"Skips to the following {SURVEY_BATCH} not yet surveyed"):
-        start = start + SURVEY_BATCH if ss.get("sv_batch_on") else 0
+    if b2.button(f"Select next {batch}  →", key="sv_b_next", **FULL_WIDTH,
+                 disabled=bool(not eligible or (ss.get("sv_batch_on") and start + batch >= len(eligible))),
+                 help=f"Skips to the following {batch} not yet surveyed"):
+        start = start + batch if ss.get("sv_batch_on") else 0
         ss["sv_batch_on"] = True
         ss["sv_sel_ver"] = ss.get("sv_sel_ver", 0) + 1
     if b3.button("✕  Clear ticks", key="sv_b_clear", **FULL_WIDTH):
         ss["sv_batch_on"] = False
         ss["sv_sel_ver"] = ss.get("sv_sel_ver", 0) + 1
     ss["sv_batch_start"] = start
-    picked = set(eligible[start:start + SURVEY_BATCH]) if ss.get("sv_batch_on") else set()
+    picked = set(eligible[start:start + batch]) if ss.get("sv_batch_on") else set()
     for row in table:
         row["Send"] = row["key"] in picked
     if picked:
